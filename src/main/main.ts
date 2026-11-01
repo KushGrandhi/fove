@@ -361,6 +361,8 @@ ipcMain.handle(CH.handoffReplan, (_e, cwd: string, note: string) =>
 );
 ipcMain.handle(CH.handoffStop, (_e, cwd: string) => handoff.stop(cwd));
 ipcMain.handle(CH.handoffReset, (_e, cwd: string) => handoff.reset(cwd));
+ipcMain.handle(CH.keelTurnOriginals, (_e, cwd: string, paneId?: string) =>
+  keel.turnOriginals(cwd, paneId ? ptys.pidOf(paneId) : undefined));
 ipcMain.handle(CH.keelTurn, (_e, cwd: string, paneId?: string) => {
   // Same translation as claudeSnapshot: a pane id names the session to read,
   // and the pid never crosses into the renderer.

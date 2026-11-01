@@ -27,6 +27,10 @@ import getConfigurationOverride, { initUserConfiguration } from "@codingame/mona
 import getLogOverride from "@codingame/monaco-vscode-log-service-override";
 import getExtensionsOverride from "@codingame/monaco-vscode-extensions-service-override";
 import getEditorServiceOverride from "@codingame/monaco-vscode-editor-service-override";
+import getScmOverride from "@codingame/monaco-vscode-scm-service-override";
+// VS Code's merge-conflict extension: Accept Current / Incoming / Both above
+// every <<<<<<< block -- git's, and the ones fove's own save-merge writes.
+import "@codingame/monaco-vscode-merge-conflict-default-extension";
 // The extension host the language client runs in, in this page rather than a
 // worker: `vscode-languageclient` is an extension, and needs the `vscode` API.
 import "vscode/localExtensionHost";
@@ -54,6 +58,7 @@ import htmlWorker from "../../../node_modules/@codingame/monaco-vscode-standalon
 
 import { DiskProvider } from "./diskProvider.js";
 import { openEditor } from "./navigation.js";
+import { startQuickDiff } from "./quickDiff.js";
 
 (self as unknown as { MonacoEnvironment: unknown }).MonacoEnvironment = {
   getWorker(_id: string, label: string) {
@@ -130,7 +135,10 @@ export function startServices(): Promise<void> {
         // A jump to another file (definition, reference, symbol) opens it in
         // a fove pane: see navigation.ts.
         ...getEditorServiceOverride(openEditor as never),
+        // Source control: VS Code's change markers in the gutter (quickDiff.ts).
+        ...getScmOverride(),
       });
+      await startQuickDiff();
       const textFiles = await getService(ITextFileService);
       /*
        * A save the file service refused. The only one fove acts on is "the

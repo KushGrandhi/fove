@@ -18,6 +18,7 @@ import { readTranscript } from "../data/transcript.js";
 import { splitTurns, latestTurn, looksFinished, type Turn, type TurnRecord } from "../shared/turns.js";
 import { compareSnapshots, summarise, confidence, type ChangeSet } from "../shared/changeset.js";
 import { SnapshotStore, takeSnapshot } from "./snapshots.js";
+import { latestTurnOriginals, type TurnOriginals } from "../shared/turn-originals.js";
 import type { ClaudeSessionService } from "./claudeSession.js";
 
 const execFileP = promisify(execFile);
@@ -286,6 +287,23 @@ export class KeelService {
    * of them sits in the same workspace is true and useless. The caller is told
    * which source was used so the UI can say so.
    */
+  /**
+   * What each file looked like before the latest turn that changed files,
+   * for the editor's turn review. Read from the same session `review` reads.
+   */
+  async turnOriginals(cwd: string, shellPid?: number): Promise<TurnOriginals | null> {
+    let summary = shellPid ? await this.sessions.forPane(cwd, shellPid) : null;
+    if (!summary) summary = await this.sessions.newestFor(cwd);
+    if (!summary) return null;
+    const records: TurnRecord[] = [];
+    try {
+      for await (const rec of readTranscript(summary.path)) records.push(rec as TurnRecord);
+    } catch {
+      // A transcript being written can end mid-line; use what was read.
+    }
+    return latestTurnOriginals(records);
+  }
+
   private async readTurns(
     cwd: string,
     shellPid?: number,

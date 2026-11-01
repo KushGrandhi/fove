@@ -39,6 +39,7 @@ const CH = {
   gitCommits: "git:commits",
   gitCommitParents: "git:commit-parents",
   keelTurn: "keel:turn",
+  keelTurnOriginals: "keel:turn-originals",
   keelBegin: "keel:begin",
   keelWorklist: "keel:worklist",
   keelCard: "keel:card",
@@ -425,6 +426,10 @@ const api = {
     ipcRenderer.invoke(CH.gitCommitParents, cwd, commit),
   keelTurn: (cwd: string, paneId?: string): Promise<unknown> =>
     ipcRenderer.invoke(CH.keelTurn, cwd, paneId),
+  /** Each file's text before Claude's latest turn changed it, for turn review. */
+  keelTurnOriginals: (cwd: string, paneId?: string): Promise<{
+    turnId: string; prompt: string; startedAt: number; files: Record<string, string>;
+  } | null> => ipcRenderer.invoke(CH.keelTurnOriginals, cwd, paneId),
   keelBegin: (cwd: string): Promise<unknown> => ipcRenderer.invoke(CH.keelBegin, cwd),
   keelWorklist: (cwd: string): Promise<unknown> => ipcRenderer.invoke(CH.keelWorklist, cwd),
   keelCard: (cwd: string, path: string): Promise<unknown> =>

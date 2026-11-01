@@ -186,7 +186,17 @@ foundation where needed:
    **Fixed on the way:** ⌘-click to another file never worked -- no pane
    ever held the navigation claim. fove's shortcuts lost to VS Code's
    keybindings inside the editor (⌘P). VS Code's web build autosaves.
-4. **Git (#15–18).**
+4. **Git (#15–18).** **Done.** VS Code's own change markers and inline
+   diff (SCM service), fed by a fove "Git" source per repository; fove's
+   hand-written change bars are gone. A ± switch compares the gutter with
+   Claude's last turn instead of HEAD -- each file's original comes from
+   the `originalFile` Claude Code records on every Edit and Write -- and a
+   "Revert this change" action in the inline diff undoes one hunk. VS Code's
+   merge-conflict extension adds Accept Current/Incoming/Both above every
+   conflict block. Blame keeps fove's git data and gains a hover card and
+   click-through to the commit. Limits: turn review sees only changes made
+   with Claude's Edit/Write tools, not shell commands; there is no
+   staging (VS Code's git extension needs Node and cannot run here).
 5. **Search and the shell (#9–11, #20, #21).** The shortcut change lands
    together with the keybinding service, so keys move once, not twice.
 6. **Debugger (#19).** Delete `dapClient.ts`.

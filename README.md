@@ -269,6 +269,16 @@ pruning drops vtsls's nested TypeScript (it looks like fove's own dev-only
 extraResources skips them otherwise. If vtsls's dependencies change, check the
 closure: a packaged app with a missing module has no TypeScript at all.
 
+**Git in the editor is VS Code's SCM, fed by fove.** `ide/quickDiff.ts`
+creates source controls through the `vscode` API (the git extension itself
+needs Node and cannot run in the page) whose originals are HEAD (`git show`)
+or, with the ± switch, each file before Claude's last turn -- read from the
+`originalFile` Claude Code records on every Edit/Write
+(`shared/turn-originals.ts`). VS Code decorates only editors its editor
+service lists as visible, so that list is extended with fove's editors; and
+the inline diff's buttons come from the git extension, so fove registers its
+own "Revert this change" in `MenuId.SCMChangeContext`.
+
 **VS Code's web defaults are not desktop's.** Autosave is on in VS Code's web
 build; `ide/vscode.ts` turns it off before the services start
 (`initUserConfiguration`), as desktop VS Code has it.

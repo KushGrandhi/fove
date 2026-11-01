@@ -26,11 +26,11 @@ import { C } from "../ui/Chrome.js";
 import { ContextMenu, type MenuItem } from "../ui/ContextMenu.js";
 import { flattenTree, ancestorsWithin } from "../../shared/tree-rows.js";
 import { breadcrumb, disambiguate, relativeTo } from "../../shared/editor-tabs.js";
-import { lineChanges } from "../../shared/line-diff.js";
 import { SCANNED_LANGUAGES, scanSymbols, type ScannedSymbol } from "../../shared/symbols.js";
 import { claimModel, releaseModel, renameModel } from "../ide/models.js";
 import { claimNavigation, releaseNavigation } from "../ide/navigation.js";
 import { ensureClients } from "../ide/languageClients.js";
+import { ensureGitSource, refreshTurns, setCompareTo, type CompareTo } from "../ide/quickDiff.js";
 import {
   backedUpPaths, backupText, discardBackup, followSize, historyFor, historyText, onSaveConflict,
   readDisk, recordHistory, saveText, servicesError, textFileModel, watchFile,
@@ -263,31 +263,13 @@ export function ensureTheme(): void {
     }
     .fove-paused-line { background: rgba(210, 153, 34, 0.18); }
 
-    /*
-     * Change bars, in the strip between the glyph margin and the line
-     * numbers. Three pixels wide and full height: the point is peripheral
-     * vision -- you should see where you have been without reading anything.
-     */
-    .fove-change-add { border-left: 3px solid #3fb950; margin-left: 2px; }
-    .fove-change-mod { border-left: 3px solid #2f6feb; margin-left: 2px; }
-    /*
-     * A deletion has no line of its own to mark, so it is drawn as a wedge
-     * hanging under the line that closed over it.
-     */
-    .fove-change-del::after {
-      content: "";
-      position: absolute;
-      bottom: -3px;
-      left: 2px;
-      border: 3px solid transparent;
-      border-top-color: #f05055;
-    }
 
     /*
      * Inline blame. Dim enough to ignore while reading code, which is most of
      * the time -- it is answering a question you have not asked yet.
      */
-    .fove-blame { color: #46464f; font-style: italic; }
+    .fove-blame { color: #46464f; font-style: italic; cursor: pointer; }
+    .fove-blame:hover { color: #7a7a86; text-decoration: underline; }
   `;
   document.head.appendChild(style);
   themeReady = true;
@@ -420,19 +402,11 @@ export function EditorPane(props: {
   onToggleBreakpointRef.current = props.onToggleBreakpoint ?? (() => {});
   /** Monaco's handle for the breakpoint decorations, so they can be replaced. */
   const bpDecorationsRef = useRef<monaco.editor.IEditorDecorationsCollection | null>(null);
-  /** The same, for the git change bars. Separate so one cannot clear the other. */
-  const changeDecorationsRef = useRef<monaco.editor.IEditorDecorationsCollection | null>(null);
-  /**
-   * Each open file as HEAD has it, for the change bars.
-   *
-   * A ref rather than state: it is read by the recompute, which already runs
-   * off a timer, and re-rendering the whole pane when a background read lands
-   * would be a render per file opened for no visible reason.
-   */
-  const headTextRef = useRef<Map<string, string>>(new Map());
   /** Blame per file, and the decoration showing it on the cursor's line. */
   const blameRef = useRef<Map<string, BlameLine[]>>(new Map());
   const blameDecorationsRef = useRef<monaco.editor.IEditorDecorationsCollection | null>(null);
+  /** Clicking the blame annotation opens that line's commit, as a diff tab. */
+  const openBlameCommitRef = useRef<(line: number) => void>(() => {});
   /** One Monaco model per *document*, so undo history survives tab switches. */
   const modelsRef = useRef<Map<string, monaco.editor.ITextModel>>(new Map());
   /** Models for the fixed sides of a diff, keyed by tab. Disposed with the tab. */
@@ -504,6 +478,8 @@ export function EditorPane(props: {
    */
   const [problems, setProblems] = useState<Problem[]>([]);
   const [problemsOpen, setProblemsOpen] = useState(false);
+  /** What the gutter's change markers compare against. */
+  const [compareTo, setCompare] = useState<CompareTo>("head");
   /** What the language service was given, for the breadcrumb bar to report. */
   /** Right-click menu position and the entry it was opened on. */
   const [menu, setMenu] = useState<{ x: number; y: number; path: string; dir: boolean } | null>(null);
@@ -1039,6 +1015,43 @@ export function EditorPane(props: {
     return () => { sub.dispose(); clearTimeout(timer); };
   }, [root, props.cwd]);
 
+  /*
+   * VS Code's change markers for this repository, measured against HEAD.
+   * HEAD moves when anyone commits or checks out -- an agent included -- so
+   * the originals are re-read when fove regains focus and every 15 seconds.
+   */
+  useEffect(() => {
+    if (!root || servicesError()) return;
+    ensureGitSource(root);
+    // A turn in progress keeps adding files, so its originals are re-read too.
+    const refresh = () => void refreshTurns();
+    const t = setInterval(refresh, 15_000);
+    window.addEventListener("focus", refresh);
+    return () => { clearInterval(t); window.removeEventListener("focus", refresh); };
+  }, [root]);
+
+  /**
+   * Flip the gutter between "what changed since HEAD" and "what Claude's last
+   * turn changed". In turn mode each marker is one of the turn's hunks, and
+   * clicking it opens VS Code's inline diff with revert -- reviewing the turn
+   * hunk by hunk, in the file, without leaving it.
+   */
+  const toggleCompare = useCallback(async () => {
+    if (!root) return;
+    const next: CompareTo = compareTo === "head" ? "turn" : "head";
+    const info = await setCompareTo(root, next);
+    if (next === "turn" && !info) {
+      await setCompareTo(root, "head");
+      setNotice("no Claude turn has edited files in this repository yet");
+      return;
+    }
+    setCompare(next);
+    setNotice(next === "turn"
+      ? `markers: what Claude's last turn changed (${info!.files} file${info!.files === 1 ? "" : "s"}) — click one to review or revert it`
+      : "markers: changes since HEAD");
+    setTimeout(() => setNotice(null), 3200);
+  }, [root, compareTo]);
+
   /**
    * Language servers for whatever was just opened.
    *
@@ -1160,17 +1173,34 @@ export function EditorPane(props: {
     const label = uncommitted
       ? "uncommitted"
       : `${hit.author} · ${ago(hit.when)} · ${hit.summary}`;
+    const end = model!.getLineMaxColumn(position.lineNumber);
+    /*
+     * Anchored at the end of the line, where the annotation is drawn, so the
+     * hover card appears over the annotation rather than over the code. The
+     * card is what VS Code's blame shows: the whole subject, who, when
+     * exactly, which commit -- and clicking the annotation opens the commit.
+     */
+    const hover = uncommitted
+      ? "**Not committed yet**"
+      : [
+          `**${hit.summary.replace(/[\\`*_[\]]/g, "\\$&")}**`,
+          `${hit.author} · ${new Date(hit.when).toLocaleString()} · \`${hit.hash.slice(0, 8)}\``,
+          "_Click the annotation to open this commit's change to the file._",
+        ].join("\n\n");
     blameDecorationsRef.current.set([{
-      range: new monaco.Range(position.lineNumber, 1, position.lineNumber, 1),
+      range: new monaco.Range(position.lineNumber, end, position.lineNumber, end),
       options: {
-        isWholeLine: true,
         after: { content: `    ${label}`, inlineClassName: "fove-blame" },
+        hoverMessage: { value: hover },
+        // An empty range draws nothing unless told to.
+        showIfCollapsed: true,
       },
     }]);
   }, [blameOn]);
 
   const paintBlameRef = useRef(paintBlame);
   paintBlameRef.current = paintBlame;
+
 
   /**
    * Blame the active file, once it is asked for.
@@ -1260,6 +1290,18 @@ export function EditorPane(props: {
       modLabel: c.short,
     });
   }, [openDiff]);
+
+  openBlameCommitRef.current = (line: number) => {
+    const ed = editorRef.current;
+    const model = ed?.getModel();
+    const path = model ? pathOfModel(modelsRef.current, model) : null;
+    const hit = path ? blameRef.current.get(path)?.[line - 1] : undefined;
+    if (!path || !hit || /^0+$/.test(hit.hash)) return;
+    openCommitDiff(path, {
+      oid: hit.hash, short: hit.hash.slice(0, 8), subject: hit.summary,
+      author: hit.author, when: ago(hit.when),
+    });
+  };
 
   /** After any successful save: the bookkeeping, and the follow-up checks. */
   const afterSave = useCallback((path: string, text: string) => {
@@ -1470,7 +1512,6 @@ export function EditorPane(props: {
     // Anything cached under the old path is about a file that no longer
     // exists. Dropped rather than moved: both are re-read on demand, and a
     // blame indexed against the old name would be quietly wrong.
-    headTextRef.current.delete(from);
     blameRef.current.delete(from);
 
     // A file tab is keyed by its path, so the key moves with it; a diff tab's
@@ -1636,35 +1677,24 @@ export function EditorPane(props: {
       onToggleBreakpointRef.current(path, line);
     });
 
-    /*
-     * Repaint the change bars as you type.
-     *
-     * Debounced, and generously: the diff is cheap on the common edit but the
-     * gutter is peripheral information -- nobody is waiting on it, and paying
-     * for it on every keystroke would be paying for nothing.
-     */
-    let changeTimer: ReturnType<typeof setTimeout> | undefined;
-    const repaintSoon = () => {
-      clearTimeout(changeTimer);
-      changeTimer = setTimeout(() => paintChangesRef.current(), 250);
-    };
-
     const subs = [
       ed.onDidChangeCursorSelection(reportSelection),
       ed.onDidFocusEditorText(reportSelection),
       // Blame follows the cursor, so it is repainted on every move. Cheap:
       // the data is already in memory and it is one decoration.
       ed.onDidChangeCursorPosition(() => paintBlameRef.current()),
-      ed.onDidChangeModelContent(repaintSoon),
-      // A tab switch is a model swap, and the bars belong to the file rather
-      // than to the editor -- without this they stay on the previous file's.
-      ed.onDidChangeModel(() => { paintChangesRef.current(); paintBlameRef.current(); }),
+      // A tab switch is a model swap; blame belongs to the file, not the editor.
+      ed.onDidChangeModel(() => paintBlameRef.current()),
+      ed.onMouseDown((e) => {
+        if (!(e.target.element as HTMLElement | null)?.classList?.contains("fove-blame")) return;
+        const line = e.target.position?.lineNumber ?? ed.getPosition()?.lineNumber;
+        if (line) openBlameCommitRef.current(line);
+      }),
       onGutter,
     ];
 
     return () => {
       clearTimeout(selTimer);
-      clearTimeout(changeTimer);
       sizing.dispose();
       for (const sub of subs) sub.dispose();
       // Detach first: the diff editor shares these models, and disposing one
@@ -1765,100 +1795,6 @@ export function EditorPane(props: {
     }
     bpDecorationsRef.current.set(decorations);
   }, [props.breakpoints, props.pausedAt, activePath]);
-
-  /**
-   * Draw the git change bars for whatever the code editor is showing.
-   *
-   * Against HEAD rather than against the index: the question the gutter
-   * answers is "what have I changed since the last commit", and staging is
-   * not an answer to it -- a staged line is still a line you changed.
-   */
-  const paintChanges = useCallback(() => {
-    const ed = editorRef.current;
-    if (!ed) return;
-    if (!changeDecorationsRef.current) {
-      changeDecorationsRef.current = ed.createDecorationsCollection();
-    }
-    const model = ed.getModel();
-    const path = model ? pathOfModel(modelsRef.current, model) : null;
-    const head = path ? headTextRef.current.get(path) : undefined;
-    // No model, or no revision to compare against: an untracked file has
-    // nothing at HEAD, and marking all of it would be a solid bar saying
-    // something you already know from the tab.
-    if (!model || head === undefined) {
-      changeDecorationsRef.current.clear();
-      return;
-    }
-
-    const changes = lineChanges(head, model.getValue());
-    const lineCount = model.getLineCount();
-    const at = (line: number, className: string, hover?: string) => ({
-      range: new monaco.Range(line, 1, line, 1),
-      options: {
-        isWholeLine: false,
-        linesDecorationsClassName: className,
-        ...(hover ? { linesDecorationsTooltip: hover } : {}),
-        stickiness: monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
-      },
-    });
-
-    const decorations: monaco.editor.IModelDeltaDecoration[] = [];
-    for (const line of changes.added) {
-      if (line <= lineCount) decorations.push(at(line, "fove-change-add"));
-    }
-    for (const line of changes.modified) {
-      if (line <= lineCount) decorations.push(at(line, "fove-change-mod"));
-    }
-    for (const d of changes.deleted) {
-      // A deletion above line 1 has no line of its own to hang under, so it
-      // is drawn on line 1 instead of being dropped.
-      const line = Math.min(Math.max(d.line, 1), lineCount);
-      const preview = d.text.slice(0, 12).join("\n");
-      decorations.push(at(
-        line,
-        "fove-change-del",
-        `${d.text.length} line${d.text.length === 1 ? "" : "s"} removed:\n${preview}`,
-      ));
-    }
-    changeDecorationsRef.current.set(decorations);
-  }, []);
-
-  /** For the mount-time listeners, which cannot see later renders' closures. */
-  const paintChangesRef = useRef(paintChanges);
-  paintChangesRef.current = paintChanges;
-
-  /**
-   * Read a file as HEAD has it, so the bars have something to compare to.
-   *
-   * Re-read rather than cached forever: a commit, a checkout or a stash all
-   * move HEAD underneath an open file, and bars against a revision that is no
-   * longer current are worse than none.
-   */
-  const loadHead = useCallback(async (path: string) => {
-    if (!root) return;
-    const rel = relativeTo(root, path);
-    if (!rel) return;
-    const text = await window.th.gitFileAt(root, "HEAD", rel);
-    if (text === null) headTextRef.current.delete(path);
-    else headTextRef.current.set(path, text);
-    paintChangesRef.current();
-  }, [root]);
-
-  /*
-   * On open, and then slowly.
-   *
-   * HEAD moves without this pane hearing about it -- a commit from the git
-   * pane, a checkout in a terminal, an agent rebasing -- and the file watcher
-   * says nothing about any of them. Fifteen seconds is far below the rate
-   * anyone notices staleness in a gutter bar, and one `git show` at that
-   * interval is nothing beside the git pane's own three-second status poll.
-   */
-  useEffect(() => {
-    if (!activePath) return;
-    void loadHead(activePath);
-    const t = setInterval(() => void loadHead(activePath), 15_000);
-    return () => clearInterval(t);
-  }, [activePath, loadHead]);
 
   /**
    * Point whichever editor the active tab needs at the right models.
@@ -2110,6 +2046,17 @@ export function EditorPane(props: {
               title="Diff this file against HEAD"
             >
               ⇄
+            </button>
+          )}
+          {root && (
+            <button
+              style={{ ...S.glyphBtn, color: compareTo === "turn" ? C.accent : C.faint }}
+              onClick={() => void toggleCompare()}
+              title={compareTo === "turn"
+                ? "Gutter shows what Claude's last turn changed (edits made with its Edit and Write tools). Click for changes since HEAD"
+                : "Gutter shows changes since HEAD. Click to see what Claude's last turn changed"}
+            >
+              {compareTo === "turn" ? "✳±" : "±"}
             </button>
           )}
           {root && (
