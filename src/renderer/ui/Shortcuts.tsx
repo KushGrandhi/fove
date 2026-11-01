@@ -45,6 +45,7 @@ export function Shortcuts(props: { onClose: () => void }) {
    */
   useEffect(() => {
     if (!recording) return;
+    keymap.suspend(true);
     const onKey = (e: KeyboardEvent) => {
       e.preventDefault();
       e.stopPropagation();
@@ -81,7 +82,10 @@ export function Shortcuts(props: { onClose: () => void }) {
       setRecording(null);
     };
     window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
+    return () => {
+      keymap.suspend(false);
+      window.removeEventListener("keydown", onKey, true);
+    };
   }, [recording]);
 
   const changed = Object.keys(overrides).length;

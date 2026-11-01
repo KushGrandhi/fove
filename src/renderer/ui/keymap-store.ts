@@ -27,6 +27,8 @@ function load(): Overrides {
 }
 
 let overrides: Overrides = load();
+/** True while the shortcuts screen is recording a key, so nothing else acts on it. */
+let suspended = false;
 const listeners = new Set<() => void>();
 
 function commit(next: Overrides): void {
@@ -48,6 +50,9 @@ export const keymap = {
   set: (id: string, chord: string | null) => commit(assign(overrides, id, chord)),
   reset: (id: string) => commit(reset(overrides, id)),
   resetAll: () => commit({}),
+  /** Hold every shortcut while a key is being recorded. */
+  suspend: (on: boolean) => { suspended = on; },
+  isSuspended: () => suspended,
   /** The command a key event triggers in a scope, if any. */
   match(e: KeyboardEvent, scope: Scope): string | undefined {
     const chord = chordFromEvent(e);

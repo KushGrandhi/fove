@@ -174,7 +174,18 @@ foundation where needed:
    the tab and then snaps back to the original file. The build before this
    work does the same; it belongs to step 3, which replaces that code.
 3. **Language servers (#6–8, #12–14).** Switch to `monaco-languageclient`;
-   delete `lspProviders.ts` and most of `tsProject.ts`.
+   delete `lspProviders.ts` and most of `tsProject.ts`. **Done.** VS Code
+   packages moved to 37.6.1, the version `monaco-languageclient` 11.0.3 is
+   built for. TypeScript/JavaScript run on bundled `vtsls`; Python on the
+   installed pyright-family server plus `ruff server`. Verified in the
+   running app, and TypeScript also in the packaged bundle: errors, hover,
+   completion, ⌘-click into another file, find references, rename across
+   files, quick fixes, ⌘⇧O symbols, `#` workspace symbols in ⌘P, a problems
+   list across languages, Format Document through the server. Format on
+   save still uses the project's own prettier/ruff, unchanged.
+   **Fixed on the way:** ⌘-click to another file never worked -- no pane
+   ever held the navigation claim. fove's shortcuts lost to VS Code's
+   keybindings inside the editor (⌘P). VS Code's web build autosaves.
 4. **Git (#15–18).**
 5. **Search and the shell (#9–11, #20, #21).** The shortcut change lands
    together with the keybinding service, so keys move once, not twice.

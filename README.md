@@ -244,6 +244,28 @@ three-way merges, `ide/merge.ts`), backs up unsaved buffers so they survive a
 quit, and keeps local history. Every `@codingame/*` package is pinned to one
 exact version; upgrade them together, on purpose.
 
+**Language features come from real language servers, through VS Code's own
+client.** `ide/languageClients.ts` runs `monaco-languageclient` (that is,
+`vscode-languageclient`) against VS Code's services; `main/lsp.ts` only starts
+the process and relays LSP messages over IPC. TypeScript/JavaScript use
+`vtsls` (tsserver), bundled and run on Electron's own Node, so no Node install
+is needed. Python uses whichever pyright-family server is installed, plus
+`ruff server`. Servers start the first time a file of their language opens,
+one per repository root. Jumps to another file reach a pane through the
+editor-service override's `openEditor` (`ide/navigation.ts`).
+
+**vtsls ships as `extraResources`, not inside the asar.** A child process
+cannot run from inside an asar archive, and electron-builder's dependency
+pruning drops vtsls's nested TypeScript (it looks like fove's own dev-only
+`typescript`). So `package.json` copies the vtsls closure into
+`Resources/vtsls`, nested `node_modules` listed separately because
+extraResources skips them otherwise. If vtsls's dependencies change, check the
+closure: a packaged app with a missing module has no TypeScript at all.
+
+**VS Code's web defaults are not desktop's.** Autosave is on in VS Code's web
+build; `ide/vscode.ts` turns it off before the services start
+(`initUserConfiguration`), as desktop VS Code has it.
+
 **VS Code's Monaco differs from the npm one in three ways that bite.**
 `automaticLayout` measures nothing, so every editor is sized by `followSize`
 in `ide/vscode.ts`. The TypeScript/JSON/CSS/HTML language services and the

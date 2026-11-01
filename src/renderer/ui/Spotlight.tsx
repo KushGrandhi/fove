@@ -23,6 +23,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { C } from "./Chrome.js";
+import { workspaceSymbols } from "../ide/languageClients.js";
 
 /** Mirrors SearchMatch in main/search.ts, which is what arrives over IPC. */
 interface Match {
@@ -80,6 +81,8 @@ export function Spotlight(props: {
   /** Why the search could not run at all, if that is what happened. */
   const [failure, setFailure] = useState<string | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
+  /** Counts symbol queries, so a slow answer to an old one is dropped. */
+  const symbolSeq = useRef(0);
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   useEffect(() => {
@@ -110,6 +113,39 @@ export function Spotlight(props: {
         return;
       }
       setSearching(true);
+      /*
+       * `#name`: symbols across the project, from the language servers --
+       * the same gesture as `#` in VS Code's quick open. Shown through the
+       * same rows, grouped by file, so Enter opens one at its line.
+       */
+      if (q.startsWith("#")) {
+        window.th.searchCancel(id);
+        const seq = ++symbolSeq.current;
+        const prefix = props.cwd.endsWith("/") ? props.cwd : `${props.cwd}/`;
+        void workspaceSymbols(q.slice(1).trim()).then(
+          (found) => {
+            if (seq !== symbolSeq.current) return;
+            setMatches(found
+              .filter((sym) => sym.path.startsWith(prefix))
+              .map((sym) => {
+                const text = [sym.name, sym.kind, sym.container].filter(Boolean).join("  ");
+                return { path: sym.path.slice(prefix.length), line: sym.line, text, start: 0, end: sym.name.length };
+              }));
+            setFailure(found.length ? null
+              : "no symbols: they come from language servers, which start when you open a file of that language");
+            setSearching(false);
+            setSettled(true);
+          },
+          (e) => {
+            if (seq !== symbolSeq.current) return;
+            setFailure(String((e as Error)?.message ?? e));
+            setSearching(false);
+            setSettled(true);
+          },
+        );
+        return;
+      }
+      symbolSeq.current++;
       // Literal, case-insensitive: Spotlight is for finding a known name, and
       // a regex mode here would be a second thing to explain. The search pane
       // keeps the toggles for when the query is really a pattern.
@@ -213,7 +249,7 @@ export function Spotlight(props: {
           <input
             autoFocus
             value={query}
-            placeholder="Find a file, or search the code…"
+            placeholder="Find a file, search the code, or # for a symbol…"
             onChange={(e) => setQuery(e.target.value)}
             style={S.input}
             onKeyDown={(e) => {
@@ -239,7 +275,7 @@ export function Spotlight(props: {
           {rows.length === 0 && (
             <div style={S.none}>
               {!query.trim()
-                ? "Type to find a file by name, or any text in the code."
+                ? "Type to find a file by name or any text in the code. Start with # to find a symbol."
                 : searching || !settled
                   ? "searching…"
                   : failure
@@ -254,7 +290,7 @@ export function Spotlight(props: {
               i === 0 && files.length > 0
                 ? "FILES"
                 : i === contentsAt && groups.length > 0
-                  ? "CODE"
+                  ? (query.startsWith("#") ? "SYMBOLS" : "CODE")
                   : null;
             // A file heading inside the contents section: the row above
             // belongs to a different file.

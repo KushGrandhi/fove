@@ -60,8 +60,7 @@ import { PopoutService } from "./popout.js";
 import { SearchService } from "./search.js";
 import { LintService } from "./lint.js";
 import { FormatService } from "./format.js";
-import { ProjectService } from "./project.js";
-import { LspService } from "./lsp.js";
+import { LanguageServerHost } from "./lsp.js";
 import {
   loadRecipe, saveRecipe, suggestRecipe, createWorktree, applyRecipe, type Recipe,
 } from "./workspace.js";
@@ -443,8 +442,10 @@ const searcher = new SearchService(
 );
 const linter = new LintService();
 const formatter = new FormatService();
-const project = new ProjectService();
-const lsp = new LspService();
+const lsp = new LanguageServerHost(
+  (id, msg) => send(CH.lsMessage, id, msg),
+  (id, info) => send(CH.lsExit, id, info),
+);
 
 ipcMain.on(CH.searchStart, (_e, id: string, q: Parameters<SearchService["start"]>[1]) =>
   searcher.start(id, q),
@@ -453,20 +454,36 @@ ipcMain.on(CH.searchCancel, (_e, id: string) => searcher.cancel(id));
 ipcMain.handle(CH.lintCheck, (_e, path: string, cwd?: string) => linter.check(path, cwd));
 ipcMain.handle(CH.formatRun, (_e, path: string, content: string, cwd?: string) =>
   formatter.run(path, content, cwd));
-ipcMain.handle(CH.projectSources, (_e, root: string) => project.sources(root));
-ipcMain.handle(CH.lspAvailable, (_e, language: string) => lsp.available(language));
-ipcMain.handle(CH.lspRequest, (_e, root: string, language: string, method: string, params: unknown) =>
-  lsp.request(root, language, method, params));
 /*
- * `handle` rather than `on`, so the renderer can wait for it.
- *
- * A notification is fire-and-forget on the wire, but the editor has to know
- * the server has *heard* about a buffer before it asks a question about it --
- * a `didOpen` still in flight and a definition request already sent is how
- * Cmd-click ends up asking about a file the server does not have open.
+ * Language servers for the editor's language client. Messages go to every
+ * window (ids are unique, so each client takes only its own); a window that
+ * closes stops the servers it started.
  */
-ipcMain.handle(CH.lspNotify, (_e, root: string, language: string, method: string, params: unknown) =>
-  lsp.notify(root, language, method, params));
+const serversBySender = new Map<number, Set<string>>();
+ipcMain.handle(CH.lsStart, async (e, id: string, kind: string, root: string) => {
+  const r = await lsp.start(id, kind, root);
+  if (r.ok) {
+    const sender = e.sender;
+    let mine = serversBySender.get(sender.id);
+    if (!mine) {
+      mine = new Set();
+      serversBySender.set(sender.id, mine);
+      const senderId = sender.id;
+      sender.once("destroyed", () => {
+        for (const sid of serversBySender.get(senderId) ?? []) lsp.stop(sid);
+        serversBySender.delete(senderId);
+      });
+    }
+    mine.add(id);
+  }
+  return r;
+});
+ipcMain.on(CH.lsSend, (_e, id: string, msg: unknown) => lsp.send(id, msg));
+ipcMain.on(CH.lsStop, (e, id: string) => {
+  serversBySender.get(e.sender.id)?.delete(id);
+  lsp.stop(id);
+});
+ipcMain.handle(CH.lsPythonPath, (_e, root: string) => lsp.pythonPath(root));
 
 // ---- browser panes --------------------------------------------------------
 /**

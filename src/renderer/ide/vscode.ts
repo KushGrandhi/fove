@@ -23,6 +23,13 @@ import getFilesOverride, {
 } from "@codingame/monaco-vscode-files-service-override";
 import getModelOverride from "@codingame/monaco-vscode-model-service-override";
 import getWorkingCopyOverride from "@codingame/monaco-vscode-working-copy-service-override";
+import getConfigurationOverride, { initUserConfiguration } from "@codingame/monaco-vscode-configuration-service-override";
+import getLogOverride from "@codingame/monaco-vscode-log-service-override";
+import getExtensionsOverride from "@codingame/monaco-vscode-extensions-service-override";
+import getEditorServiceOverride from "@codingame/monaco-vscode-editor-service-override";
+// The extension host the language client runs in, in this page rather than a
+// worker: `vscode-languageclient` is an extension, and needs the `vscode` API.
+import "vscode/localExtensionHost";
 import { IWorkingCopyBackupService } from "@codingame/monaco-vscode-api/vscode/vs/workbench/services/workingCopy/common/workingCopyBackup.service";
 import { IWorkingCopyHistoryService } from "@codingame/monaco-vscode-api/vscode/vs/workbench/services/workingCopy/common/workingCopyHistory.service";
 import { CancellationToken } from "@codingame/monaco-vscode-api/vscode/vs/base/common/cancellation";
@@ -30,10 +37,9 @@ import type { IReference } from "@codingame/monaco-vscode-api/vscode/vs/base/com
 import type { ITextFileEditorModel } from "@codingame/monaco-vscode-api/vscode/vs/workbench/services/textfile/common/textfiles";
 import { SaveSourceRegistry } from "@codingame/monaco-vscode-api/vscode/vs/workbench/common/editor";
 
-// Grammars for ~90 languages, and the four rich language services Monaco
-// used to bundle. VS Code's build of Monaco leaves all of them out.
+// Grammars for ~90 languages, and the JSON/CSS/HTML services Monaco used to
+// bundle. TypeScript and JavaScript come from vtsls instead (languageClients.ts).
 import "@codingame/monaco-vscode-standalone-languages";
-import "@codingame/monaco-vscode-standalone-typescript-language-features";
 import "@codingame/monaco-vscode-standalone-json-language-features";
 import "@codingame/monaco-vscode-standalone-css-language-features";
 import "@codingame/monaco-vscode-standalone-html-language-features";
@@ -42,19 +48,18 @@ import "@codingame/monaco-vscode-standalone-html-language-features";
  * resolve through a package's `exports` map (see README, "Monaco workers").
  */
 import editorWorker from "../../../node_modules/@codingame/monaco-vscode-api/workers/editor.worker.js?worker";
-import tsWorker from "../../../node_modules/@codingame/monaco-vscode-standalone-typescript-language-features/languages/features/typescript/ts.worker.js?worker";
 import jsonWorker from "../../../node_modules/@codingame/monaco-vscode-standalone-json-language-features/languages/features/json/json.worker.js?worker";
 import cssWorker from "../../../node_modules/@codingame/monaco-vscode-standalone-css-language-features/languages/features/css/css.worker.js?worker";
 import htmlWorker from "../../../node_modules/@codingame/monaco-vscode-standalone-html-language-features/languages/features/html/html.worker.js?worker";
 
 import { DiskProvider } from "./diskProvider.js";
+import { openEditor } from "./navigation.js";
 
 (self as unknown as { MonacoEnvironment: unknown }).MonacoEnvironment = {
   getWorker(_id: string, label: string) {
     if (label === "json") return new jsonWorker();
     if (label === "css" || label === "scss" || label === "less") return new cssWorker();
     if (label === "html" || label === "handlebars" || label === "razor") return new htmlWorker();
-    if (label === "typescript" || label === "javascript") return new tsWorker();
     return new editorWorker();
   },
 };
@@ -101,10 +106,30 @@ export function startServices(): Promise<void> {
       // the whole point of hot exit.
       await createIndexedDBProviders();
       registerCustomProvider("file", new DiskProvider());
+      /*
+       * VS Code's settings, where fove's differ from the library's defaults.
+       *
+       * The library is VS Code's *web* build, and on the web autosave is on
+       * (a second after you stop typing). Desktop VS Code leaves it off, and
+       * so does fove: an agent reading a file you are halfway through
+       * editing should see the last version you saved, and unsaved edits are
+       * what hot exit and the merge-on-save flow exist to protect.
+       */
+      await initUserConfiguration(JSON.stringify({
+        "files.autoSave": "off",
+      }));
       await initialize({
         ...getFilesOverride(),
         ...getModelOverride(),
         ...getWorkingCopyOverride({ storage: "userData" }),
+        // What VS Code's language client needs: settings it can read, a log,
+        // and an extension host to run in.
+        ...getConfigurationOverride(),
+        ...getLogOverride(),
+        ...getExtensionsOverride({ enableWorkerExtensionHost: false }),
+        // A jump to another file (definition, reference, symbol) opens it in
+        // a fove pane: see navigation.ts.
+        ...getEditorServiceOverride(openEditor as never),
       });
       const textFiles = await getService(ITextFileService);
       /*

@@ -451,17 +451,35 @@ export function App() {
    */
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (!(e.metaKey || e.ctrlKey || e.altKey)) return;
+      if (!(e.metaKey || e.ctrlKey || e.altKey) || keymap.isSuspended()) return;
+      /*
+       * A plain text field (the palette, Spotlight, a commit message) keeps
+       * its keys. The editor and the terminals are text fields too, but they
+       * are where shortcuts are pressed most, so they do not count.
+       */
+      const t = e.target as HTMLElement | null;
+      const field = t?.closest?.("input, textarea, [contenteditable='true']");
+      if (field && !field.closest(".monaco-editor, .xterm")) return;
       const focusedKind = focusedKindRef.current;
       const inTerminal = focusedKind === "shell" || focusedKind === "claude";
       const id = (inTerminal ? keymap.match(e, "terminal") : undefined) ?? keymap.match(e, "app");
       const run = id ? actionsRef.current[id] : undefined;
       if (!run) return;
       e.preventDefault();
+      e.stopPropagation();
       run();
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    /*
+     * Capture phase, so fove's shortcuts win over the editor's own: VS Code's
+     * keybindings claim ⌘P and ⌘⇧P inside the editor, and in the bubble
+     * phase they never got here. On `document`, not `window`: the editor
+     * pane's own keys (⌘S, ⌘W on a file tab) listen on `window`, and capture
+     * reaches `window` first whatever order the listeners were added in --
+     * editor panes mount after the app, so registration order would put
+     * this one first and ⌘W would close the pane instead of the tab.
+     */
+    document.addEventListener("keydown", onKey, true);
+    return () => document.removeEventListener("keydown", onKey, true);
   }, []);
 
   /**

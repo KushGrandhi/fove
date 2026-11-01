@@ -110,6 +110,20 @@ export const DEPS: Dep[] = [
     alternatives: ["basedpyright-langserver", "jedi-language-server", "pylsp"],
   },
   {
+    /*
+     * Python lint, quick fixes and formatting, as a language server
+     * (`ruff server`). Without it Python still has pyright's errors and
+     * navigation, just no ruff findings and no format on save.
+     */
+    bin: "ruff",
+    label: "Ruff",
+    severity: "feature",
+    needs: "Python lint findings, quick fixes and format on save.",
+    brew: "ruff",
+    url: "https://docs.astral.sh/ruff/installation/",
+    versionArg: "--version",
+  },
+  {
     bin: "code",
     label: "VS Code CLI",
     severity: "optional",

@@ -28,17 +28,15 @@ import { flattenTree, ancestorsWithin } from "../../shared/tree-rows.js";
 import { breadcrumb, disambiguate, relativeTo } from "../../shared/editor-tabs.js";
 import { lineChanges } from "../../shared/line-diff.js";
 import { SCANNED_LANGUAGES, scanSymbols, type ScannedSymbol } from "../../shared/symbols.js";
-import {
-  claimModel, claimNavigation, ensureEditorOpener, loadProject, releaseModel,
-  releaseNavigation, renameModel, type ProjectStatus,
-} from "../ide/tsProject.js";
+import { claimModel, releaseModel, renameModel } from "../ide/models.js";
+import { claimNavigation, releaseNavigation } from "../ide/navigation.js";
+import { ensureClients } from "../ide/languageClients.js";
 import {
   backedUpPaths, backupText, discardBackup, followSize, historyFor, historyText, onSaveConflict,
   readDisk, recordHistory, saveText, servicesError, textFileModel, watchFile,
   type HistoryEntry,
 } from "../ide/vscode.js";
 import { hasConflictMarkers, threeWay } from "../ide/merge.js";
-import { closeDocument, noteRoot, registerLspProviders } from "../ide/lspProviders.js";
 import { keymap } from "../ui/keymap-store.js";
 
 /*
@@ -110,6 +108,17 @@ interface BlameLine {
   when: number;
   line: number;
   summary: string;
+}
+
+/** One diagnostic, for the problems list. */
+interface Problem {
+  path: string;
+  line: number;
+  column: number;
+  error: boolean;
+  message: string;
+  /** "basedpyright", "Ruff", "ts", "fove-lint"... */
+  source: string;
 }
 
 /** A commit in a file's history. */
@@ -331,14 +340,34 @@ function ensureSymbolProviders(): void {
   };
 
   for (const language of SCANNED_LANGUAGES) {
-    monaco.languages.registerDocumentSymbolProvider(language, {
+    scanners.set(language, monaco.languages.registerDocumentSymbolProvider(language, {
       displayName: "fove",
       provideDocumentSymbols(model) {
         return scanSymbols(language, model.getValue()).map((s) => convert(s, model));
       },
-    });
+    }));
   }
 }
+
+/** The outline scanner per language, so a language server can replace it. */
+const scanners = new Map<string, monaco.IDisposable>();
+
+/**
+ * Stand the outline scanner down for a language a server now answers.
+ *
+ * Both would otherwise be asked, and the symbol picker would list every
+ * Python function twice: once from pyright, once from the scanner.
+ */
+function yieldScanner(language: string): void {
+  scanners.get(language)?.dispose();
+  scanners.delete(language);
+}
+
+/** Server kinds already reported missing this session. */
+const toldMissing = new Set<string>();
+
+/** Roots where `ruff server` is running, so the ruff CLI is not run as well. */
+const ruffServes = new Set<string>();
 
 /** The path a model was opened under, since Monaco models carry no path of ours. */
 function pathOfModel(
@@ -469,8 +498,13 @@ export function EditorPane(props: {
   const [history, setHistory] = useState<Commit[] | null>(null);
   /** Local history of the active file: fove's saves and outside writes. Null while closed. */
   const [local, setLocal] = useState<HistoryEntry[] | null>(null);
+  /**
+   * Problems in this repository's open files, from every source: the
+   * language servers (pyright, tsserver, ruff) and fove's own lint.
+   */
+  const [problems, setProblems] = useState<Problem[]>([]);
+  const [problemsOpen, setProblemsOpen] = useState(false);
   /** What the language service was given, for the breadcrumb bar to report. */
-  const [project, setProject] = useState<ProjectStatus | null>(null);
   /** Right-click menu position and the entry it was opened on. */
   const [menu, setMenu] = useState<{ x: number; y: number; path: string; dir: boolean } | null>(null);
   /** An inline text box in the tree: renaming an entry, or naming a new one. */
@@ -759,7 +793,7 @@ export function EditorPane(props: {
         }
         if (modelsRef.current.has(path)) {
           // Two callers raced into the same file; the first model wins.
-          releaseModel(path, model.getValue());
+          releaseModel(path);
         } else {
           modelsRef.current.set(path, model);
           contentSubsRef.current.get(path)?.dispose();
@@ -904,12 +938,16 @@ export function EditorPane(props: {
   const lint = useCallback(async (path: string) => {
     const model = modelsRef.current.get(path);
     if (!model) return;
+    // `ruff server` already publishes these, live; running the CLI as well
+    // would show every finding twice.
+    if (ruffServes.has(rootRef.current ?? props.cwd)) return;
     const diags = (await window.th.lintCheck(path, props.cwd)) as {
       line: number; column: number; endLine: number; endColumn: number;
       message: string; code?: string; severity: "error" | "warning" | "info";
     }[];
-    // The model may have been closed while ruff ran.
-    if (model.isDisposed()) return;
+    // The model may have been closed while ruff ran -- or `ruff server` may
+    // have come up meanwhile and now owns these findings.
+    if (model.isDisposed() || ruffServes.has(rootRef.current ?? props.cwd)) return;
     monaco.editor.setModelMarkers(
       model,
       "fove-lint",
@@ -972,63 +1010,75 @@ export function EditorPane(props: {
 
   // ---- language service ---------------------------------------------------
 
-  /**
-   * Hand the project to Monaco's TypeScript service, so navigation reaches
-   * past the open file.
-   *
-   * Keyed on the repository root rather than the pane's cwd: a pane opened on
-   * `src/` is still working in the same program as one opened on the root,
-   * and loading it twice under two names would double the memory for nothing.
-   */
   useEffect(() => {
     const where = root ?? props.cwd;
-    if (!where) return;
-    let live = true;
-    void loadProject(where).then((s) => {
-      if (!live) return;
-      setProject(s);
-      // Only worth saying when it is not the whole truth.
-      if (s.skipped > 0) {
-        setNotice(`indexed ${s.files} files, skipped ${s.skipped}`);
-        setTimeout(() => setNotice(null), 2600);
-      }
+    const prefix = where.endsWith("/") ? where : `${where}/`;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const collect = () => {
+      const S = monaco.MarkerSeverity;
+      setProblems(monaco.editor.getModelMarkers({})
+        .filter((m) => m.resource.scheme === "file" && m.resource.fsPath.startsWith(prefix)
+          && (m.severity === S.Error || m.severity === S.Warning))
+        .map((m) => ({
+          path: m.resource.fsPath,
+          line: m.startLineNumber,
+          column: m.startColumn,
+          error: m.severity === S.Error,
+          message: m.message.split("\n")[0] ?? m.message,
+          source: m.source ?? m.owner,
+        }))
+        .sort((a, b) => Number(b.error) - Number(a.error)
+          || a.path.localeCompare(b.path) || a.line - b.line));
+    };
+    collect();
+    // Servers publish in bursts as they analyse; one recount per burst.
+    const sub = monaco.editor.onDidChangeMarkers(() => {
+      clearTimeout(timer);
+      timer = setTimeout(collect, 200);
     });
-    return () => { live = false; };
+    return () => { sub.dispose(); clearTimeout(timer); };
   }, [root, props.cwd]);
 
   /**
-   * A language server for whatever was just opened, if one is installed.
+   * Language servers for whatever was just opened.
    *
-   * Driven by the file you open rather than started up front: a Python server
-   * indexes the whole project on start, and a session that never opens a
-   * `.py` file should never pay for that.
+   * Driven by the file you open rather than started up front: pyright and
+   * tsserver index the whole project on start, and a session that never
+   * opens a `.py` file should never pay for that. Keyed on the repository
+   * root, so a pane opened on `src/` shares the server of one opened on the
+   * root.
    */
   useEffect(() => {
     const where = root ?? props.cwd;
     const language = activeDoc?.language;
-    const path = activeDoc?.path;
-    if (!where || !language || !path) return;
-
-    // This pane's own working directory is the answer to "which repository is
-    // this file in" -- the provider should never have to infer it from a path.
-    noteRoot(path, where);
-
-    /*
-     * No `live` guard on the notice.
-     *
-     * There was one, and it was why this never said anything: the effect runs
-     * first with the pane's cwd, then again the moment `gitRoot` resolves, and
-     * the cleanup from that first run cancelled the notice it was about to
-     * show. The second run then found the language already wired and said
-     * nothing either. Registration is idempotent and the notice is about the
-     * machine rather than about this render, so neither needs cancelling.
-     */
-    void registerLspProviders(where, language).then((server) => {
-      if (!server) return;
-      setNotice(`${language}: ${server}`);
-      setTimeout(() => setNotice(null), 2200);
+    if (!where || !language) return;
+    void ensureClients(language, where).then((statuses) => {
+      const running = statuses.filter((st) => st.name);
+      if (statuses.some((st) => st.kind === "python" && st.name)) yieldScanner("python");
+      if (statuses.some((st) => st.kind === "ruff" && st.name) && !ruffServes.has(where)) {
+        ruffServes.add(where);
+        // The CLI may already have run on a file opened before the server
+        // was up; its findings would now sit beside the server's own.
+        const prefix = where.endsWith("/") ? where : `${where}/`;
+        for (const m of monaco.editor.getModels()) {
+          if (m.uri.scheme === "file" && m.uri.fsPath.startsWith(prefix)) {
+            monaco.editor.setModelMarkers(m, "fove-lint", []);
+          }
+        }
+      }
+      // A missing server is said once per session, not on every file opened.
+      const missing = statuses.filter((st) => !st.name && !toldMissing.has(st.kind)).map((st) => st.kind);
+      for (const kind of missing) toldMissing.add(kind);
+      if (running.length === 0 && missing.length === 0) return;
+      const text = [running.length ? `${language}: ${running.map((st) => st.name).join(" + ")}` : "",
+        missing.length ? `no ${missing.join(", ")} server (Setup Check)` : ""]
+        .filter(Boolean).join(" · ");
+      // Background information: it never pushes out a notice already up,
+      // such as "restored unsaved edits".
+      setNotice((prev) => prev ?? text);
+      setTimeout(() => setNotice((prev) => (prev === text ? null : prev)), 2600);
     });
-  }, [root, props.cwd, activeDoc?.language, activeDoc?.path]);
+  }, [root, props.cwd, activeDoc?.language]);
 
   /**
    * Go-to-definition lands here.
@@ -1037,29 +1087,34 @@ export function EditorPane(props: {
    * request it hands back for somebody to fulfil. This pane fulfils it when
    * it is the one with the focus -- see `claimNavigation`.
    */
-  const navigateTo = useCallback((path: string, line: number, column: number) => {
-    void (async () => {
-      await openFile(path);
-      requestAnimationFrame(() => {
-        const ed = editorRef.current;
-        if (!ed) return;
-        ed.revealLineInCenter(line);
-        ed.setPosition({ lineNumber: line, column });
-        ed.focus();
-      });
-    })();
+  const navigateTo = useCallback(async (path: string, line: number, column: number) => {
+    await openFile(path);
+    // The model is swapped in by an effect; wait for it to land.
+    await new Promise((r) => requestAnimationFrame(() => r(null)));
+    const ed = editorRef.current;
+    if (!ed) return undefined;
+    ed.revealLineInCenter(line);
+    ed.setPosition({ lineNumber: line, column });
+    ed.focus();
+    return ed;
   }, [openFile]);
 
+  /*
+   * Claim navigation on mount, and again whenever focus enters this pane.
+   *
+   * Not tied to the Monaco instance: this effect runs before the one that
+   * creates the editor, and waiting for `editorRef` here meant the claim was
+   * skipped on mount and never retried -- so no pane ever held it, and every
+   * jump to another file went nowhere. Focus is watched on the pane's own
+   * DOM, which exists from the first render.
+   */
   useEffect(() => {
-    ensureEditorOpener();
-    const ed = editorRef.current;
-    if (!ed) return;
-    // Claim on mount as well as on focus: a pane that opens and is
-    // immediately navigated from should not need a click first.
     claimNavigation(navigateTo);
-    const sub = ed.onDidFocusEditorText(() => claimNavigation(navigateTo));
+    const host = hostRef.current;
+    const claim = () => claimNavigation(navigateTo);
+    host?.addEventListener("focusin", claim);
     return () => {
-      sub.dispose();
+      host?.removeEventListener("focusin", claim);
       releaseNavigation(navigateTo);
     };
   }, [navigateTo]);
@@ -1345,15 +1400,9 @@ export function EditorPane(props: {
         const model = modelsRef.current.get(closed.path);
         contentSubsRef.current.get(closed.path)?.dispose();
         contentSubsRef.current.delete(closed.path);
-        // A language server holds an in-memory copy of every buffer it has
-        // been told about; closing the tab is when it should go back to
-        // reading the file from disk like any other.
-        const language = docsRef.current.get(closed.path)?.language;
-        const where = rootRef.current ?? props.cwd;
-        if (language && where) closeDocument(where, language, closed.path);
-        // Hand the file back to the language service as plain text before the
-        // buffer goes, so closing a tab does not remove it from the program.
-        if (model) releaseModel(closed.path, model.getValue());
+        // Give the pane's reference back. The language client follows the
+        // model on its own and tells its server the buffer closed.
+        if (model) releaseModel(closed.path);
         modelsRef.current.delete(closed.path);
         docsRef.current = new Map(docsRef.current);
         docsRef.current.delete(closed.path);
@@ -1629,7 +1678,7 @@ export function EditorPane(props: {
       // probably still using them.
       for (const sub of contentSubsRef.current.values()) sub.dispose();
       contentSubsRef.current.clear();
-      for (const [path, m] of modelsRef.current) releaseModel(path, m.getValue());
+      for (const path of modelsRef.current.keys()) releaseModel(path);
       modelsRef.current.clear();
       for (const models of sideModelsRef.current.values()) for (const m of models) m.dispose();
       sideModelsRef.current.clear();
@@ -2078,6 +2127,15 @@ export function EditorPane(props: {
               </button>
             </>
           )}
+          {problems.length > 0 && (
+            <button
+              style={{ ...S.glyphBtn, color: problems.some((p) => p.error) ? C.red : C.yellow }}
+              onClick={() => setProblemsOpen((v) => !v)}
+              title="Problems in the open files"
+            >
+              ⚠ {problems.length}
+            </button>
+          )}
           {/* Local history needs no repository, so this is not under `root`. */}
           {active && (
             <button
@@ -2214,6 +2272,37 @@ export function EditorPane(props: {
         * off, and giving it a pane would mean rearranging the workspace to
         * ask a question and rearranging it back afterwards.
         */}
+      {/*
+        * Problems, as a sheet like history: a list you read to pick one off.
+        * Clicking a row opens the file at the problem.
+        */}
+      {problemsOpen && (
+        <>
+          <div style={S.scrim} onClick={() => setProblemsOpen(false)} />
+          <div style={S.history}>
+            <div style={S.historyHead}>
+              <span>problems ({problems.length})</span>
+              <span style={{ flex: 1 }} />
+              <button style={S.glyphBtn} onClick={() => setProblemsOpen(false)} title="Close (esc)">✕</button>
+            </div>
+            {problems.length === 0 && <div style={S.historyEmpty}>no problems in the open files</div>}
+            {problems.map((p, i) => (
+              <div
+                key={`${p.path}:${p.line}:${p.column}:${i}`}
+                style={S.historyRow}
+                onClick={() => { setProblemsOpen(false); void navigateTo(p.path, p.line, p.column); }}
+                title={`${p.path}:${p.line}\n${p.message}`}
+              >
+                <span style={{ color: p.error ? C.red : C.yellow, flexShrink: 0 }}>{p.error ? "●" : "▲"}</span>
+                <span style={S.ellipsis}>{p.message}</span>
+                <span style={S.historyMeta}>{p.source}</span>
+                <span style={S.historyMeta}>{p.path.split("/").pop()}:{p.line}</span>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
       {history && active && (
         <>
           <div style={S.scrim} onClick={closeHistory} />
