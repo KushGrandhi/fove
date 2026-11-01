@@ -28,6 +28,10 @@ import getLogOverride from "@codingame/monaco-vscode-log-service-override";
 import getExtensionsOverride from "@codingame/monaco-vscode-extensions-service-override";
 import getEditorServiceOverride from "@codingame/monaco-vscode-editor-service-override";
 import getScmOverride from "@codingame/monaco-vscode-scm-service-override";
+import { trackEditorFocus } from "./editorCommands.js";
+import { startEditorKeys } from "./editorKeys.js";
+import getBulkEditOverride from "@codingame/monaco-vscode-bulk-edit-service-override";
+import getDialogsOverride from "@codingame/monaco-vscode-dialogs-service-override";
 // VS Code's merge-conflict extension: Accept Current / Incoming / Both above
 // every <<<<<<< block -- git's, and the ones fove's own save-merge writes.
 import "@codingame/monaco-vscode-merge-conflict-default-extension";
@@ -137,8 +141,18 @@ export function startServices(): Promise<void> {
         ...getEditorServiceOverride(openEditor as never),
         // Source control: VS Code's change markers in the gutter (quickDiff.ts).
         ...getScmOverride(),
+        // Edits across files (rename, the Search pane's replace) as VS Code
+        // applies them: unopened files are loaded, open editors update, and
+        // the whole edit is one undo.
+        ...getBulkEditOverride(),
+        // VS Code's in-window dialogs, for the questions its services ask --
+        // "undo this replace in all files, or just this one?". Without it they
+        // fall back to the browser's bare confirm().
+        ...getDialogsOverride(),
       });
       await startQuickDiff();
+      await trackEditorFocus();
+      startEditorKeys();
       const textFiles = await getService(ITextFileService);
       /*
        * A save the file service refused. The only one fove acts on is "the
@@ -307,3 +321,4 @@ export async function historyText(path: string, id: string): Promise<string | nu
   if (!entry) return null;
   return (await files.readFile(entry.location)).value.toString();
 }
+

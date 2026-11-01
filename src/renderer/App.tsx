@@ -22,6 +22,7 @@ import { SessionCard } from "./ui/widgets.js";
 import { TeammateBar, TeammateView, useTeammates } from "./ui/Teammates.js";
 import { C, Divider, LayoutMenu, ToolButton, ToolMenu } from "./ui/Chrome.js";
 import { Palette, type PaletteItem } from "./ui/Palette.js";
+import { editorCommands } from "./ide/editorCommands.js";
 import { Spotlight } from "./ui/Spotlight.js";
 import { Shortcuts } from "./ui/Shortcuts.js";
 import { keymap, useKeymap } from "./ui/keymap-store.js";
@@ -460,6 +461,9 @@ export function App() {
       const t = e.target as HTMLElement | null;
       const field = t?.closest?.("input, textarea, [contenteditable='true']");
       if (field && !field.closest(".monaco-editor, .xterm")) return;
+      // Inside the editor, the editor's own keys come first (the ones listed
+      // under "Editing (VS Code)" and "Editor pane" in Shortcuts).
+      if (t?.closest?.(".monaco-editor") && keymap.match(e, "editor")) return;
       const focusedKind = focusedKindRef.current;
       const inTerminal = focusedKind === "shell" || focusedKind === "claude";
       const id = (inTerminal ? keymap.match(e, "terminal") : undefined) ?? keymap.match(e, "app");
@@ -1127,10 +1131,22 @@ export function App() {
   }, []);
 
   const [paletteOpen, setPaletteOpen] = useState(false);
+  /** The focused editor's own commands, read each time the palette opens. */
+  const [editorItems, setEditorItems] = useState<PaletteItem[]>([]);
   const openPalette = useCallback(() => {
     // Refresh on open so the counts are current rather than whatever they were
     // when the tab was last switched.
     if (active?.cwd) void loadWorktrees(active.cwd);
+    setEditorItems([]);
+    void editorCommands().then((cmds) => setEditorItems(cmds.map((c) => ({
+      id: `editor:${c.id}`,
+      label: c.label,
+      icon: "✎",
+      hint: c.key,
+      // After fove's own commands for an empty query; typing finds them.
+      priority: -1,
+      run: c.run,
+    }))));
     setPaletteOpen(true);
   }, [active?.cwd, loadWorktrees]);
   openPaletteRef.current = openPalette;
@@ -1340,7 +1356,7 @@ export function App() {
 
       {paletteOpen && (
         <Palette
-          items={paletteItems}
+          items={editorItems.length ? [...paletteItems, ...editorItems] : paletteItems}
           empty={worktrees.length === 0 ? "not a git repository" : "nothing here"}
           onClose={() => setPaletteOpen(false)}
         />

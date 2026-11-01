@@ -17,6 +17,7 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { spawnEnv } from "./loginPath.js";
+import { bundledBin } from "./bundled.js";
 
 /** Never return an unbounded result set: the UI cannot use 200k rows. */
 const MAX_MATCHES = 2000;
@@ -29,6 +30,20 @@ const MAX_MATCHES = 2000;
  * searching paths at all.
  */
 const PATH_MATCH_CAP = 50;
+
+/** Candidates handed back for ranking in `fuzzyPaths` mode. */
+const FUZZY_PATH_CAP = 10000;
+
+/** Every character of `needle` in order somewhere in `path`: the loose prefilter. */
+function looseMatcher(needle: string): (path: string) => { start: number; end: number; exact: boolean } | null {
+  const chars = needle.replace(/\s+/g, "");
+  return (path: string) => {
+    const hay = path.toLowerCase();
+    let i = 0;
+    for (let j = 0; j < hay.length && i < chars.length; j++) if (hay[j] === chars[i]) i++;
+    return i === chars.length ? { start: 0, end: 0, exact: false } : null;
+  };
+}
 
 export interface SearchMatch {
   path: string;
@@ -60,6 +75,14 @@ export interface SearchQuery {
   /** Only files matching these globs, e.g. ["*.ts", "!*.test.ts"]. */
   globs?: string[];
   wholeWord?: boolean;
+  /**
+   * Hand back every path that holds the query's characters in order, up to
+   * FUZZY_PATH_CAP, for the caller to rank. Spotlight does this: it ranks
+   * with VS Code's own fuzzy scorer, which needs the candidates rather than
+   * a shortlist picked by a simpler rule here. Spaces in the query separate
+   * pieces, as in VS Code's quick open, and are ignored by this filter.
+   */
+  fuzzyPaths?: boolean;
 }
 
 /** `rg --json` event shapes, narrowed to what is used here. */
@@ -148,6 +171,22 @@ function rgEnv(): Promise<NodeJS.ProcessEnv> {
   return envOnce;
 }
 
+/**
+ * The ripgrep to run: the user's own when their login PATH has one, else the
+ * copy fove ships (bundled.ts), so search works on a machine with nothing
+ * installed. Resolved once, like the environment.
+ */
+let rgOnce: Promise<string> | undefined;
+function rgCommand(): Promise<string> {
+  rgOnce ??= rgEnv().then((env) => new Promise<string>((resolve) => {
+    const child = spawn("rg", ["--version"], { stdio: "ignore", env });
+    const fallback = () => resolve(bundledBin("rg") ?? "rg");
+    child.on("error", fallback);
+    child.on("exit", (code) => (code === 0 ? resolve("rg") : fallback()));
+  }));
+  return rgOnce;
+}
+
 export class SearchService {
   /** The in-flight search per requester id, so a new one supersedes it. */
   private readonly running = new Map<string, ChildProcess>();
@@ -157,6 +196,9 @@ export class SearchService {
    * its environment was still being resolved.
    */
   private generation = 0;
+
+  /** The ripgrep binary the current search runs (rgCommand). */
+  private rg = "rg";
 
   constructor(
     private readonly onMatch: (id: string, matches: SearchMatch[]) => void,
@@ -168,8 +210,9 @@ export class SearchService {
   /** Whether ripgrep is available at all, so the UI can say so plainly. */
   static async available(): Promise<boolean> {
     const env = await rgEnv();
+    const rg = await rgCommand();
     return new Promise((resolve) => {
-      const child = spawn("rg", ["--version"], { stdio: "ignore", env });
+      const child = spawn(rg, ["--version"], { stdio: "ignore", env });
       child.on("error", () => resolve(false));
       child.on("exit", (code) => resolve(code === 0));
     });
@@ -210,12 +253,15 @@ export class SearchService {
      * outlives the query that asked for it.
      */
     const generation = ++this.generation;
-    void rgEnv().then((env) => {
+    void Promise.all([rgEnv(), rgCommand()]).then(([env, rg]) => {
       if (generation !== this.generation) return;
+      this.rg = rg;
       // Filenames first: they are usually what a bare word like "AGENTS.md"
       // means, and they finish fast enough to appear before the content hits.
+      // Candidates handed back for ranking are not results yet, so they do
+      // not use up the content pass's budget.
       this.searchPaths(id, q, env, (pathCount) =>
-        this.searchContents(id, q, env, pathCount));
+        this.searchContents(id, q, env, q.fuzzyPaths ? 0 : pathCount));
     });
   }
 
@@ -235,11 +281,12 @@ export class SearchService {
     const args = ["--files"];
     for (const glob of q.globs ?? []) args.push("--glob", glob);
 
-    const child = spawn("rg", args, { cwd: q.cwd, env });
+    const child = spawn(this.rg, args, { cwd: q.cwd, env });
     this.running.set(id, child);
 
     const needle = q.caseSensitive ? q.query : q.query.toLowerCase();
-    const match = pathMatcher(needle, q.caseSensitive === true);
+    const match = q.fuzzyPaths ? looseMatcher(needle) : pathMatcher(needle, q.caseSensitive === true);
+    const cap = q.fuzzyPaths ? FUZZY_PATH_CAP : PATH_MATCH_CAP;
     let buffer = "";
     let found = 0;
     let batch: SearchMatch[] = [];
@@ -249,7 +296,7 @@ export class SearchService {
       const lines = buffer.split("\n");
       buffer = lines.pop() ?? "";
       for (const path of lines) {
-        if (!path || found >= PATH_MATCH_CAP) continue;
+        if (!path || found >= cap) continue;
         const hit = match(path);
         if (!hit) continue;
         found++;
@@ -273,7 +320,7 @@ export class SearchService {
       // Whatever is left in `buffer` is the last path, unterminated by a
       // newline. Dropping it would silently lose one result.
       const tail = buffer.trim();
-      if (tail && found < PATH_MATCH_CAP) {
+      if (tail && found < cap) {
         const hit = match(tail);
         if (hit) {
           found++;
@@ -313,7 +360,7 @@ export class SearchService {
     // `--` so a query beginning with a dash is a pattern, not a flag.
     args.push("--", q.query, ".");
 
-    const child = spawn("rg", args, { cwd: q.cwd, env });
+    const child = spawn(this.rg, args, { cwd: q.cwd, env });
     this.running.set(id, child);
 
     let count = priorCount;

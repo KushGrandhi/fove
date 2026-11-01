@@ -11,14 +11,16 @@
     "postinstall": "electron-rebuild -f -w node-pty",
     "typecheck": "tsc -p tsconfig.main.json --noEmit && tsc -p tsconfig.renderer.json --noEmit",
     "test": "vitest run",
-    "pack": "npm run build && node scripts/fetch-ruff.mjs && electron-builder --dir",
-    "dist": "npm run build && node scripts/fetch-ruff.mjs && electron-builder",
+    "pack": "npm run build && node scripts/fetch-tools.mjs && electron-builder --dir",
+    "dist": "npm run build && node scripts/fetch-tools.mjs && electron-builder",
     "sign:adhoc": "codesign --force --deep --sign - release/mac-arm64/fove.app && codesign -dv release/mac-arm64/fove.app",
     "install:local": "npm run pack && codesign --force --deep --sign - release/mac-arm64/fove.app && rm -rf /Applications/fove.app && cp -R release/mac-arm64/fove.app /Applications/ && codesign --force --deep --sign - /Applications/fove.app && echo 'Installed. Open fove from Spotlight or the Applications folder.'"
   },
   "dependencies": {
     "@codingame/monaco-vscode-api": "37.6.1",
+    "@codingame/monaco-vscode-bulk-edit-service-override": "37.6.1",
     "@codingame/monaco-vscode-configuration-service-override": "37.6.1",
+    "@codingame/monaco-vscode-dialogs-service-override": "37.6.1",
     "@codingame/monaco-vscode-editor-service-override": "37.6.1",
     "@codingame/monaco-vscode-extensions-service-override": "37.6.1",
     "@codingame/monaco-vscode-files-service-override": "37.6.1",

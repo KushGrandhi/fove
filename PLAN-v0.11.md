@@ -197,8 +197,26 @@ foundation where needed:
    click-through to the commit. Limits: turn review sees only changes made
    with Claude's Edit/Write tools, not shell commands; there is no
    staging (VS Code's git extension needs Node and cannot run here).
-5. **Search and the shell (#9–11, #20, #21).** The shortcut change lands
+5. **Search and the shell (#9–11, #20, #21).** — **Done.** All five below,
+   verified in the running app. Found on the way: ripgrep was never shipped,
+   so search found nothing without Homebrew's `rg`; it is now bundled like
+   ruff. Not done: the replace preview is inline in each row (struck text,
+   then the replacement), not a diff tab.
+   The shortcut change lands
    together with the keybinding service, so keys move once, not twice.
+   **Rule: fove's own surfaces stay; VS Code parts go underneath them.**
+   ⌘P is already Spotlight (files, code, `#` symbols), ⌘⇧P is fove's
+   palette, ⌘⇧F is the Search pane, and the breadcrumb is fove's. None of
+   them is replaced by VS Code's widget. What changes:
+   - #9: Spotlight and the palette rank with VS Code's fuzzy scorer
+     (`vs/base/common/fuzzyScorer`) in place of `palette-rank.ts`'s own.
+   - #10: the Search pane gains replace, previewed in a diff editor and
+     applied through the working copies (open editors update, undo works).
+   - #11: the breadcrumb gains the symbol path at the cursor, from the
+     language servers' document symbols.
+   - #20: fove's palette lists the editor's commands with their keys, read
+     from VS Code's command and keybinding registries.
+   - #21: editor-internal keys become rebindable in fove's Shortcuts screen.
 6. **Debugger (#19).** Delete `dapClient.ts`.
 
 The old editor code is deleted step by step as each piece is replaced.

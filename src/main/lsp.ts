@@ -24,6 +24,7 @@ import { createRequire } from "node:module";
 import { join } from "node:path";
 import { ensureToolPath } from "./loginPath.js";
 import { interpreterFor } from "./interpreters.js";
+import { bundledBin } from "./bundled.js";
 
 /**
  * Installed servers to try, best first, per server kind.
@@ -114,7 +115,7 @@ function firstExisting(packaged: string[], dev: () => string | null): string | n
  *
  *   - python: basedpyright (MIT), pure JavaScript, on Electron's Node
  *   - ruff: the official ruff binary, fetched and checksummed at build time
- *     by scripts/fetch-ruff.mjs
+ *     by scripts/fetch-tools.mjs
  */
 function bundledSpec(kind: string): Spec | null {
   if (kind === "python") {
@@ -132,11 +133,7 @@ function bundledSpec(kind: string): Spec | null {
       : null;
   }
   if (kind === "ruff") {
-    // The repository's build/bin, in development: three levels up from the
-    // compiled dist/main/main/lsp.js, two from the source under test.
-    const bin = firstExisting(["bin", "ruff"], () =>
-      [join(__dirname, "..", "..", "..", "build", "bin", "ruff"), join(__dirname, "..", "..", "build", "bin", "ruff")]
-        .find((p) => existsSync(p)) ?? null);
+    const bin = bundledBin("ruff");
     return bin ? { command: bin, args: ["server"], name: "ruff (bundled)" } : null;
   }
   return null;
@@ -145,7 +142,7 @@ function bundledSpec(kind: string): Spec | null {
 /**
  * The ruff to run as a command (format on save, the lint fallback): the
  * user's own if their shell has one, else the one fove ships. Null only in a
- * development checkout that never ran scripts/fetch-ruff.mjs.
+ * development checkout that never ran scripts/fetch-tools.mjs.
  */
 export async function ruffCommand(): Promise<string | null> {
   await ensureToolPath();

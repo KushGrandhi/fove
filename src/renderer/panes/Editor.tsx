@@ -26,6 +26,7 @@ import { C } from "../ui/Chrome.js";
 import { ContextMenu, type MenuItem } from "../ui/ContextMenu.js";
 import { flattenTree, ancestorsWithin } from "../../shared/tree-rows.js";
 import { breadcrumb, disambiguate, relativeTo } from "../../shared/editor-tabs.js";
+import { kindGlyph, symbolPathAt, type SymbolCrumb } from "../ide/symbolPath.js";
 import { SCANNED_LANGUAGES, scanSymbols, type ScannedSymbol } from "../../shared/symbols.js";
 import { claimModel, releaseModel, renameModel } from "../ide/models.js";
 import { claimNavigation, releaseNavigation } from "../ide/navigation.js";
@@ -441,6 +442,8 @@ export function EditorPane(props: {
   /** Paths with unsaved edits. Keyed by document, since a diff tab shares one. */
   const [dirty, setDirty] = useState<Set<string>>(new Set());
   const [notice, setNotice] = useState<string | null>(null);
+  /** The symbols enclosing the cursor, shown after the file in the breadcrumb. */
+  const [symbols, setSymbols] = useState<SymbolCrumb[]>([]);
   const [treeOpen, setTreeOpen] = useState(true);
   /** Side-by-side or inline, for every diff tab in this pane. */
   const [sideBySide, setSideBySide] = useState(true);
@@ -1677,6 +1680,20 @@ export function EditorPane(props: {
       onToggleBreakpointRef.current(path, line);
     });
 
+    let symTimer: ReturnType<typeof setTimeout> | undefined;
+    function followSymbols() {
+      clearTimeout(symTimer);
+      symTimer = setTimeout(() => {
+        const model = ed.getModel();
+        const pos = ed.getPosition();
+        if (!model || !pos) { setSymbols([]); return; }
+        void symbolPathAt(model, pos).then((trail) => {
+          // A model swapped while the outline was computing: drop the answer.
+          if (ed.getModel() === model) setSymbols(trail);
+        });
+      }, 120);
+    }
+
     const subs = [
       ed.onDidChangeCursorSelection(reportSelection),
       ed.onDidFocusEditorText(reportSelection),
@@ -1685,6 +1702,10 @@ export function EditorPane(props: {
       ed.onDidChangeCursorPosition(() => paintBlameRef.current()),
       // A tab switch is a model swap; blame belongs to the file, not the editor.
       ed.onDidChangeModel(() => paintBlameRef.current()),
+      // The breadcrumb's symbol trail follows the cursor and the text.
+      ed.onDidChangeCursorPosition(followSymbols),
+      ed.onDidChangeModel(followSymbols),
+      ed.onDidChangeModelContent(followSymbols),
       ed.onMouseDown((e) => {
         if (!(e.target.element as HTMLElement | null)?.classList?.contains("fove-blame")) return;
         const line = e.target.position?.lineNumber ?? ed.getPosition()?.lineNumber;
@@ -1695,6 +1716,7 @@ export function EditorPane(props: {
 
     return () => {
       clearTimeout(selTimer);
+      clearTimeout(symTimer);
       sizing.dispose();
       for (const sub of subs) sub.dispose();
       // Detach first: the diff editor shares these models, and disposing one
@@ -2002,6 +2024,25 @@ export function EditorPane(props: {
                 {c.name}
               </button>
               {!c.leaf && <span style={S.crumbSep}>›</span>}
+            </span>
+          ))}
+          {/* Where the cursor is inside the file, from VS Code's outline model. */}
+          {active.kind !== "diff" && symbols.map((sym, i) => (
+            <span key={`${i}:${sym.name}`} style={S.crumbWrap}>
+              <span style={S.crumbSep}>›</span>
+              <button
+                style={{ ...S.crumb, color: i === symbols.length - 1 ? C.fg : C.dim }}
+                title={`Go to ${sym.name}`}
+                onClick={() => {
+                  const ed = editorRef.current;
+                  if (!ed) return;
+                  ed.setPosition({ lineNumber: sym.line, column: sym.column });
+                  ed.revealLineInCenterIfOutsideViewport(sym.line);
+                  ed.focus();
+                }}
+              >
+                <span style={S.symGlyph}>{kindGlyph(sym.kind)}</span>{sym.name}
+              </button>
             </span>
           ))}
 
@@ -2438,6 +2479,7 @@ const S: Record<string, React.CSSProperties> = {
     fontSize: 11, fontFamily: "inherit",
   },
   crumbSep: { color: "#3a3a44" },
+  symGlyph: { color: "#6b6b78", marginRight: 3 },
   revPill: {
     color: C.dim, background: "#191922", border: `1px solid ${C.line}`,
     borderRadius: 3, padding: "0 5px", fontSize: 10,

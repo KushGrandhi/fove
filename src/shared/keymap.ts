@@ -36,6 +36,12 @@ export interface Command {
    * macOS or VS Code already gives a meaning; `test/keymap.test.ts` checks it.
    */
   foveOnly?: boolean;
+  /**
+   * For the editor's own commands: the VS Code command this is. Its default
+   * is VS Code's macOS default, and a change here is handed to VS Code's
+   * keybinding service (ide/editorKeys.ts) rather than handled by fove.
+   */
+  vscode?: string;
 }
 
 const tabs: Command[] = Array.from({ length: 9 }, (_, i) => ({
@@ -79,7 +85,40 @@ export const COMMANDS: Command[] = [
   { id: "editor.save", label: "Save", group: "Editor pane", scope: "editor", key: "cmd+s" },
   { id: "editor.closeTab", label: "Close file tab", group: "Editor pane", scope: "editor", key: "cmd+w" },
   { id: "editor.symbol", label: "Go to symbol in file", group: "Editor pane", scope: "editor", key: "shift+cmd+o" },
+  ...editing(),
 ];
+
+/**
+ * The editor's own keys, as VS Code ships them on macOS. The everyday ones,
+ * not all four hundred: the palette lists the rest, with their keys.
+ */
+function editing(): Command[] {
+  const e = (vscode: string, label: string, key: string): Command =>
+    ({ id: `vs:${vscode}`, label, group: "Editing (VS Code)", scope: "editor", key, vscode });
+  return [
+    e("editor.action.commentLine", "Toggle line comment", "cmd+/"),
+    e("editor.action.blockComment", "Toggle block comment", "shift+alt+a"),
+    e("editor.action.addSelectionToNextFindMatch", "Select next match", "cmd+d"),
+    e("editor.action.selectHighlights", "Select all matches", "shift+cmd+l"),
+    e("editor.action.insertCursorAbove", "Add cursor above", "alt+cmd+up"),
+    e("editor.action.insertCursorBelow", "Add cursor below", "alt+cmd+down"),
+    e("editor.action.moveLinesUpAction", "Move line up", "alt+up"),
+    e("editor.action.moveLinesDownAction", "Move line down", "alt+down"),
+    e("editor.action.copyLinesDownAction", "Copy line down", "shift+alt+down"),
+    e("editor.action.deleteLines", "Delete line", "shift+cmd+k"),
+    e("editor.action.formatDocument", "Format document", "shift+alt+f"),
+    e("editor.action.rename", "Rename symbol", "f2"),
+    e("editor.action.revealDefinition", "Go to definition", "f12"),
+    e("editor.action.goToReferences", "Find references", "shift+f12"),
+    e("editor.action.quickFix", "Quick fix", "cmd+."),
+    e("editor.action.triggerSuggest", "Show suggestions", "ctrl+space"),
+    e("editor.action.marker.next", "Next problem in this file", "alt+f8"),
+    e("actions.find", "Find", "cmd+f"),
+    e("editor.action.startFindReplaceAction", "Find and replace", "alt+cmd+f"),
+    e("editor.fold", "Fold", "alt+cmd+["),
+    e("editor.unfold", "Unfold", "alt+cmd+]"),
+  ];
+}
 
 export const COMMAND_BY_ID = new Map(COMMANDS.map((c) => [c.id, c]));
 

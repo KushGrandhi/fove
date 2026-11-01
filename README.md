@@ -29,7 +29,7 @@ macOS on Apple silicon. `node-pty` is compiled, so there is no x86 build.
 | `claude` | required | every claude pane — the app's reason to exist |
 | `git` | required | the git pane, worktrees, diffs, commit graph |
 | `tmux` | feature | teammate tabs; without it a swarm is never detected |
-| `rg` | feature | the search pane |
+| `rg` | feature | nothing, strictly: fove ships its own for Spotlight and the Search pane |
 | `code` | optional | the "open in VS Code" buttons |
 
 The list lives in [`src/shared/deps.ts`](src/shared/deps.ts); the Setup Check
@@ -252,7 +252,7 @@ the process and relays LSP messages over IPC. TypeScript/JavaScript use
 is needed. Python uses whichever pyright-family server is installed, plus
 `ruff server` -- and when the machine has neither, the copies fove ships:
 basedpyright (npm, run on Electron's Node) and the official ruff binary,
-which `scripts/fetch-ruff.mjs` downloads at pack time, pinned and checked
+which `scripts/fetch-tools.mjs` downloads at pack time, pinned and checked
 against its published SHA-256. A new user gets Python navigation, type
 errors, lint, fixes and format on save with nothing installed. Format on
 save and the lint fallback use the bundled ruff too (`ruffCommand` in
@@ -278,6 +278,27 @@ or, with the ± switch, each file before Claude's last turn -- read from the
 service lists as visible, so that list is extended with fove's editors; and
 the inline diff's buttons come from the git extension, so fove registers its
 own "Revert this change" in `MenuId.SCMChangeContext`.
+
+**fove's own surfaces stay; VS Code's parts go underneath.** Spotlight (⌘P),
+the palette (⌘⇧P), the Search pane, the breadcrumb and the Shortcuts screen
+are fove's. Under them: Spotlight and the palette rank with VS Code's quick
+open scorer (`ui/fuzzy.ts`); the Search pane's replace builds its pattern
+and replacement with VS Code's find code and applies through the bulk edit
+service, one undo across files (`ide/replace.ts`); the breadcrumb's symbol
+trail comes from VS Code's outline model (`ide/symbolPath.ts`); the palette
+lists the focused editor's actions with their keys (`ide/editorCommands.ts`);
+and editor keys changed in Shortcuts are handed to VS Code's keybinding
+service (`ide/editorKeys.ts`). Two rules of fove's on top of VS Code's: a
+replace never saves a file that already had unsaved edits, and a file no
+editor shows is saved again after ⌘Z undoes a replace in it, so the disk
+never silently disagrees with the undo.
+
+**ripgrep and ruff are bundled binaries.** `scripts/fetch-tools.mjs`
+downloads both at pack time, pinned and checked against their published
+SHA-256, into `build/bin`, which ships as `Resources/bin`
+(`main/bundled.ts` finds them). A tool on the user's PATH still wins. Run
+the script once in a fresh checkout, or Spotlight and search find nothing on
+a machine without ripgrep (and its tests fail).
 
 **VS Code's web defaults are not desktop's.** Autosave is on in VS Code's web
 build; `ide/vscode.ts` turns it off before the services start
