@@ -38,6 +38,7 @@ import {
   releaseNavigation, renameModel, type ProjectStatus,
 } from "../ide/tsProject.js";
 import { closeDocument, noteRoot, registerLspProviders } from "../ide/lspProviders.js";
+import { keymap } from "../ui/keymap-store.js";
 
 /** A file the pane has open: its metadata. The text lives in a Monaco model. */
 interface Doc {
@@ -429,6 +430,9 @@ export function EditorPane(props: {
   const [docs, setDocs] = useState<Map<string, Doc>>(new Map());
   const [tabs, setTabs] = useState<Tab[]>([]);
   const [activeKey, setActiveKey] = useState<string | null>(null);
+  /** For the key handler, which is registered once and must see the current tab. */
+  const activeKeyRef = useRef<string | null>(null);
+  activeKeyRef.current = activeKey;
   /** Paths with unsaved edits. Keyed by document, since a diff tab shares one. */
   const [dirty, setDirty] = useState<Set<string>>(new Set());
   const [notice, setNotice] = useState<string | null>(null);
@@ -1641,16 +1645,30 @@ export function EditorPane(props: {
         setHistory(null);
         return;
       }
-      if (!(e.metaKey || e.ctrlKey) || !focused()) return;
+      if (!(e.metaKey || e.ctrlKey || e.altKey) || !focused()) return;
+      const command = keymap.match(e, "editor");
 
-      if (e.key === "s") {
+      if (command === "editor.save") {
         e.preventDefault();
         e.stopPropagation();
         void save();
         return;
       }
 
-      if (e.key === "O" || (e.key === "o" && e.shiftKey)) {
+      /*
+       * Close the smallest thing first: the file tab. With no tab open the
+       * key falls through to the app, which closes the pane.
+       */
+      if (command === "editor.closeTab") {
+        const key = activeKeyRef.current;
+        if (!key || !tabsRef.current.some((t) => t.key === key)) return;
+        e.preventDefault();
+        e.stopPropagation();
+        closeTab(key);
+        return;
+      }
+
+      if (command === "editor.symbol") {
         // A diff tab's right-hand editor is the one showing the file.
         const target = diffRef.current && editorRef.current?.getModel() === null
           ? diffRef.current.getModifiedEditor()
@@ -1664,7 +1682,7 @@ export function EditorPane(props: {
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [save]);
+  }, [save, closeTab]);
 
   const parent = dir.replace(/\/[^/]+$/, "") || "/";
   /** The visible tree, depth-first, following what is expanded. */
