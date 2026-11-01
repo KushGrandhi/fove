@@ -1653,7 +1653,11 @@ export function App() {
         <Divider />
         <span style={{ color: C.faint }}>{tabs.length} workspace{tabs.length === 1 ? "" : "s"}</span>
         <div style={S.grow} />
-        <span style={{ color: C.faint }}>⌘⇧P pins a workspace</span>
+        <span style={{ color: C.faint }}>
+          {keymap.hint("ws.pinTab")
+            ? `${keymap.hint("ws.pinTab")} pins a workspace`
+            : `pin a workspace from the palette (${keymap.hint("go.palette") || "toolbar"})`}
+        </span>
       </div>
     </div>
   );

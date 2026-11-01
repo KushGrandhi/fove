@@ -234,10 +234,34 @@ silently, no error. Node only.
 file with no module resolution, so channel names are duplicated in
 `src/main/preload.ts`; `test/ipc-contract.test.ts` keeps the copy honest.
 
+**The editor runs on VS Code's own services.** `monaco-editor` is an alias for
+`@codingame/monaco-vscode-editor-api` (VS Code's build of Monaco), and
+`src/renderer/ide/vscode.ts` starts VS Code's file, text-file and working-copy
+services before the first render. Files go through `ide/diskProvider.ts` to
+`main/diskFs.ts` over IPC. That is what reloads an open tab when an agent writes
+the file, refuses a save that would overwrite a newer file (fove then
+three-way merges, `ide/merge.ts`), backs up unsaved buffers so they survive a
+quit, and keeps local history. Every `@codingame/*` package is pinned to one
+exact version; upgrade them together, on purpose.
+
+**VS Code's Monaco differs from the npm one in three ways that bite.**
+`automaticLayout` measures nothing, so every editor is sized by `followSize`
+in `ide/vscode.ts`. The TypeScript/JSON/CSS/HTML language services and the
+grammars are separate `@codingame/monaco-vscode-standalone-*` packages,
+imported in `ide/vscode.ts`. And some editor features are workbench commands
+rather than editor actions: `getAction("editor.action.quickOutline")` returns
+null, `trigger(…, "workbench.action.gotoSymbol")` works.
+
 **Monaco workers need relative paths under Rolldown.** Vite's `?worker` suffix
-does not resolve against a package's `exports` map, so the five Monaco workers
-are imported via `../../../node_modules/monaco-editor/...`. Without them the
+does not resolve against a package's `exports` map, so the workers are imported
+via `../../../node_modules/@codingame/...` in `ide/vscode.ts`. Without them the
 editor renders but every language feature silently does nothing.
+
+**Driving the app from a script:** start it with
+`--user-data-dir=<scratch dir> --remote-debugging-port=<port>` so it cannot
+touch your real layout, and bring the window to the front over CDP
+(`Page.bringToFront`). A window behind others is "hidden" to Chromium, which
+skips repaints, so the screen lags the model and checks read stale text.
 
 **Editor languages come from Monaco's own registry**, not a hand-written map —
 91 languages, and new ones arrive with a Monaco upgrade. A small table adds

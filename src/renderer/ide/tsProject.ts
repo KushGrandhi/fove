@@ -32,7 +32,8 @@ import * as monaco from "monaco-editor";
  * export; the old path is still there but now types as `{ deprecated: true }`,
  * so reaching for it fails at compile time rather than at runtime.
  */
-import { typescript as ts } from "monaco-editor";
+import * as ts from "@codingame/monaco-vscode-standalone-typescript-language-features";
+import { openText, textFileModel, type TextModelRef } from "./vscode.js";
 
 /** What the project load settled on, for the pane to report. */
 export interface ProjectStatus {
@@ -87,93 +88,79 @@ export function isProjectFile(path: string): boolean {
 }
 
 /**
- * The model for a path, created if it does not exist yet.
+ * Each pane's hold on a file's model, as VS Code references.
+ *
+ * Models are shared -- two editor panes showing the same file show the same
+ * model, which is what makes an edit in one appear in the other. VS Code's
+ * text-model service counts the references and disposes the model when the
+ * last one goes (keeping it, and its backup, while it has unsaved edits).
+ */
+const refs = new Map<string, TextModelRef[]>();
+
+/**
+ * Take a reference to a file's model, resolving it from disk if needed.
  *
  * Taking over from the extra lib rather than sitting beside it: the same file
  * present twice in one program is a program where every symbol has two
  * declarations, and find-references would report each one twice.
  */
-export function modelFor(
-  path: string,
-  language: string,
-  content: string,
-): monaco.editor.ITextModel {
+export async function claimModel(path: string): Promise<monaco.editor.ITextModel> {
   extraLibs.get(path)?.dispose();
   extraLibs.delete(path);
-  claims.set(path, (claims.get(path) ?? 0) + 1);
-
-  const uri = monaco.Uri.file(path);
-  const existing = monaco.editor.getModel(uri);
-  if (existing) {
-    // Another pane already has it open. That model is the live buffer and
-    // wins over a fresh read -- overwriting it would discard unsaved edits.
-    return existing;
+  const ref = await openText(path);
+  const model = ref.object.textEditorModel;
+  if (!model) {
+    ref.dispose();
+    throw new Error("the file has no text model");
   }
-  return monaco.editor.createModel(content, language, uri);
+  refs.set(path, [...(refs.get(path) ?? []), ref]);
+  return model;
 }
 
 /**
- * How many panes are holding a file's buffer open.
+ * Give up one pane's reference, and hand the file back to the program as
+ * plain text once nobody holds it.
  *
- * Models are shared -- two editor panes showing the same file show the same
- * model, which is what makes an edit in one appear in the other. That also
- * means neither of them may dispose it on the way out, so disposal happens
- * here, when the last claim is given up.
+ * Without that last part, closing a tab would remove the file from the
+ * language service entirely -- and "find all references" would quietly stop
+ * finding the ones in a file you happened to have opened and closed.
  */
-const claims = new Map<string, number>();
+export function releaseModel(path: string, finalText: string): void {
+  const list = refs.get(path);
+  list?.pop()?.dispose();
+  if (list && list.length > 0) return;
+  refs.delete(path);
+  if (extraLibText.has(path)) addExtraLib(path, finalText);
+}
 
 /**
- * Give up one pane's claim on a file, and its buffer once nobody holds it.
+ * Move a file's buffer to its new path after a rename on disk.
  *
- * The file then goes back to the program as plain text. Without that last
- * part, closing a tab would remove the file from the language service
- * entirely -- and "find all references" would quietly stop finding the ones
- * in a file you happened to have opened and closed, which is a bug nobody
- * would ever connect to closing a tab.
+ * A model's URI is fixed for its lifetime, so the model at the new path is a
+ * new one. Unsaved edits are carried over (the new buffer is dirty with
+ * them); the old model is reverted first, so VS Code does not keep it alive
+ * as an orphan of a path that no longer exists. Undo history does not
+ * survive -- Monaco offers no way to move it.
  */
-/**
- * Move a file's buffer to a new path.
- *
- * A Monaco model's URI is fixed for its lifetime, so this rebuilds it rather
- * than renaming it. That matters now that models carry file URIs at all:
- * without it a renamed file kept a model whose URI named a path that no
- * longer exists, the language service went on resolving imports to the old
- * name, and opening the new path built a *second* model for the same file.
- *
- * The cost is the undo history, which cannot survive a new model. Monaco
- * offers no way to keep it, and a stale URI is the worse of the two.
- */
-export function renameModel(
-  from: string,
-  to: string,
-  language: string,
-): monaco.editor.ITextModel | null {
-  const old = monaco.editor.getModel(monaco.Uri.file(from));
-  if (!old) return null;
-  const text = old.getValue();
-
-  const claimed = claims.get(from) ?? 0;
-  claims.delete(from);
+export async function renameModel(from: string, to: string): Promise<monaco.editor.ITextModel | null> {
+  const list = refs.get(from);
+  if (!list?.length) return null;
+  const text = list[0]!.object.textEditorModel?.getValue() ?? "";
+  const holders = list.length;
+  await (await textFileModel(from))?.revert({ soft: true });
+  for (const r of list) r.dispose();
+  refs.delete(from);
   extraLibs.get(from)?.dispose();
   extraLibs.delete(from);
   const wasProjectFile = extraLibText.delete(from);
-  old.dispose();
 
-  const next = monaco.editor.createModel(text, language, monaco.Uri.file(to));
-  if (claimed > 0) claims.set(to, claimed);
+  let next: monaco.editor.ITextModel | null = null;
+  for (let i = 0; i < holders; i++) next = await claimModel(to);
+  if (next && next.getValue() !== text) next.setValue(text);
   // Still the project's file, under its new name -- so closing its tab hands
   // it back to the language service at the path it now has.
   if (wasProjectFile) extraLibText.set(to, text);
   return next;
-}
-
-export function releaseModel(path: string, finalText: string): void {
-  const left = (claims.get(path) ?? 1) - 1;
-  if (left > 0) { claims.set(path, left); return; }
-  claims.delete(path);
-
-  monaco.editor.getModel(monaco.Uri.file(path))?.dispose();
-  if (extraLibText.has(path)) addExtraLib(path, finalText);
 }
 
 /**

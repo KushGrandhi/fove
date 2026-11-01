@@ -22,11 +22,6 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as monaco from "monaco-editor";
-import editorWorker from "../../../node_modules/monaco-editor/esm/vs/editor/editor.worker.js?worker";
-import jsonWorker from "../../../node_modules/monaco-editor/esm/vs/language/json/json.worker.js?worker";
-import cssWorker from "../../../node_modules/monaco-editor/esm/vs/language/css/css.worker.js?worker";
-import htmlWorker from "../../../node_modules/monaco-editor/esm/vs/language/html/html.worker.js?worker";
-import tsWorker from "../../../node_modules/monaco-editor/esm/vs/language/typescript/ts.worker.js?worker";
 import { C } from "../ui/Chrome.js";
 import { ContextMenu, type MenuItem } from "../ui/ContextMenu.js";
 import { flattenTree, ancestorsWithin } from "../../shared/tree-rows.js";
@@ -34,11 +29,33 @@ import { breadcrumb, disambiguate, relativeTo } from "../../shared/editor-tabs.j
 import { lineChanges } from "../../shared/line-diff.js";
 import { SCANNED_LANGUAGES, scanSymbols, type ScannedSymbol } from "../../shared/symbols.js";
 import {
-  claimNavigation, ensureEditorOpener, loadProject, modelFor, releaseModel,
+  claimModel, claimNavigation, ensureEditorOpener, loadProject, releaseModel,
   releaseNavigation, renameModel, type ProjectStatus,
 } from "../ide/tsProject.js";
+import {
+  backedUpPaths, backupText, discardBackup, followSize, historyFor, historyText, onSaveConflict,
+  readDisk, recordHistory, saveText, servicesError, textFileModel, watchFile,
+  type HistoryEntry,
+} from "../ide/vscode.js";
+import { hasConflictMarkers, threeWay } from "../ide/merge.js";
 import { closeDocument, noteRoot, registerLspProviders } from "../ide/lspProviders.js";
 import { keymap } from "../ui/keymap-store.js";
+
+/*
+ * Per-window bookkeeping shared by every editor pane.
+ *
+ * A file open in two panes gets one disk event and one save conflict, but two
+ * listeners; these keep that from turning into two history entries or two
+ * merges.
+ */
+/** The last outside change recorded in local history, per path: its mtime and text. */
+const historyRecorded = new Map<string, { mtime: number; text: string }>();
+/** What fove itself last wrote to each path, to tell its own saves apart. */
+const lastSaved = new Map<string, string>();
+/** Paths whose save conflict is being merged right now. */
+const merging = new Set<string>();
+/** Backups already reopened this session, so a second pane does not reopen them. */
+const restored = new Set<string>();
 
 /** A file the pane has open: its metadata. The text lives in a Monaco model. */
 interface Doc {
@@ -108,21 +125,6 @@ interface Commit {
 function diffKey(path: string, rev: string, modRev?: string): string {
   return `diff:${rev}..${modRev ?? ""}:${path}`;
 }
-
-/**
- * Monaco resolves its language services through this global. Vite bundles each
- * worker as its own entry (see vite.config.ts); without this the editor renders
- * but every language feature silently does nothing.
- */
-(self as unknown as { MonacoEnvironment: unknown }).MonacoEnvironment = {
-  getWorker(_id: string, label: string) {
-    if (label === "json") return new jsonWorker();
-    if (label === "css" || label === "scss" || label === "less") return new cssWorker();
-    if (label === "html" || label === "handlebars" || label === "razor") return new htmlWorker();
-    if (label === "typescript" || label === "javascript") return new tsWorker();
-    return new editorWorker();
-  },
-};
 
 /**
  * Resolve a file to a Monaco language id using Monaco's OWN registry.
@@ -465,6 +467,8 @@ export function EditorPane(props: {
   }, [blameOn]);
   /** Commits that touched the active file, or null while the list is closed. */
   const [history, setHistory] = useState<Commit[] | null>(null);
+  /** Local history of the active file: fove's saves and outside writes. Null while closed. */
+  const [local, setLocal] = useState<HistoryEntry[] | null>(null);
   /** What the language service was given, for the breadcrumb bar to report. */
   const [project, setProject] = useState<ProjectStatus | null>(null);
   /** Right-click menu position and the entry it was opened on. */
@@ -620,43 +624,155 @@ export function EditorPane(props: {
    * working tree need the same document, and the diff must not get a second
    * model with its own undo stack.
    */
+  /**
+   * What the file was when the buffer last matched the disk, per path.
+   *
+   * The common ancestor for a three-way merge when a save is refused: your
+   * buffer is one side, the disk the other, and this is where both started.
+   */
+  const baseRef = useRef<Map<string, string>>(new Map());
+  /** Paths merged with conflict blocks, and the disk mtime they were merged against. */
+  const pendingMergeRef = useRef<Map<string, number>>(new Map());
+  /** Set by the conflict handler, so the save that triggered it does not also report a failure. */
+  const conflictSeenRef = useRef(false);
+
+  const setDirtyFor = useCallback((path: string, isDirty: boolean) => {
+    setDirty((prev) => {
+      if (prev.has(path) === isDirty) return prev;
+      const next = new Set(prev);
+      if (isDirty) next.add(path); else next.delete(path);
+      return next;
+    });
+  }, []);
+
+  /**
+   * Follow one open file: dirty state, backups, disk changes, local history.
+   *
+   * Dirty comes from VS Code's text-file model, not from "has it changed
+   * since open" -- so undoing back to the saved text clears the dot, and a
+   * buffer restored from a backup opens dirty. Returns one disposable for all
+   * of it.
+   */
+  const trackDocument = useCallback(async (
+    path: string,
+    model: monaco.editor.ITextModel,
+  ): Promise<monaco.IDisposable> => {
+    const subs: { dispose(): void }[] = [];
+    const file = await textFileModel(path);
+    const isDirty = () => file?.isDirty() ?? false;
+
+    setDirtyFor(path, isDirty());
+    // A buffer restored dirty from a backup did not come from the disk, so
+    // its base is whatever the disk holds now.
+    baseRef.current.set(path, isDirty() ? (await readDisk(path).catch(() => null))?.text ?? "" : model.getValue());
+
+    if (file) {
+      subs.push(file.onDidChangeDirty(() => {
+        setDirtyFor(path, file.isDirty());
+        if (!file.isDirty()) {
+          baseRef.current.set(path, model.getValue());
+          void discardBackup(file);
+        }
+      }));
+    }
+
+    /*
+     * A content change on a clean buffer is VS Code reloading it from disk:
+     * that is the new base. On a dirty buffer it is typing, and the buffer is
+     * backed up a second after you stop, so a quit or a crash keeps it.
+     */
+    let backupTimer: ReturnType<typeof setTimeout> | undefined;
+    subs.push(model.onDidChangeContent(() => {
+      if (!isDirty()) {
+        baseRef.current.set(path, model.getValue());
+        return;
+      }
+      clearTimeout(backupTimer);
+      backupTimer = setTimeout(() => { if (file && file.isDirty()) void backupText(file); }, 1000);
+    }));
+    subs.push({ dispose: () => clearTimeout(backupTimer) });
+
+    // VS Code's workbench watches the workspace; fove watches each open file.
+    subs.push(await watchFile(path));
+
+    /*
+     * An outside write -- an agent, a checkout, a formatter -- goes into
+     * local history, so it is a point you can return to even though fove did
+     * not make it. fove's own saves are recorded by `save` instead.
+     */
+    subs.push({
+      dispose: window.th.onDfsChanged((changes) => {
+        if (!changes.some((c) => c.path === path && c.type !== "deleted")) return;
+        void (async () => {
+          const disk = await readDisk(path).catch(() => null);
+          if (!disk || disk.text === lastSaved.get(path)) return;
+          // Same write seen twice, or rewritten with the same text: one entry.
+          const prev = historyRecorded.get(path);
+          if (prev && (prev.mtime === disk.mtime || prev.text === disk.text)) return;
+          historyRecorded.set(path, { mtime: disk.mtime, text: disk.text });
+          await recordHistory(path, true).catch(() => {});
+        })();
+      }),
+    });
+
+    return { dispose: () => { for (const s of subs) s.dispose(); } };
+  }, [setDirtyFor]);
+
+  /**
+   * Make sure a path has a document and a model, reading it if it has not been.
+   *
+   * Idempotent, because both opening a file tab and opening a diff against the
+   * working tree need the same document, and the diff must not get a second
+   * model with its own undo stack.
+   */
   const ensureDoc = useCallback(async (path: string): Promise<Doc> => {
     const known = docsRef.current.get(path);
     if (known) return known;
 
+    // Main's read is still the gate for what should not open as text at all:
+    // binaries, directories, files too large to hold in a buffer.
     const r = (await window.th.fileRead(path)) as {
       content?: string; mtimeMs?: number; readonly?: boolean; error?: string;
     };
     // Monaco's registry is authoritative; main's map is only a hint.
     const language = languageForPath(path);
+    const broken = servicesError();
     const doc: Doc = {
       path,
       name: path.split("/").pop() ?? path,
       mtimeMs: r.mtimeMs ?? 0,
       language,
       readonly: r.readonly,
-      error: r.error,
+      error: r.error ?? (broken ? "the editor's file services did not start (see the console)" : undefined),
     };
 
-    // Two callers can race into the same file; the first model wins.
     if (!doc.error && !modelsRef.current.has(path)) {
-      /*
-       * Keyed by file URI, and shared with the language service's copy of the
-       * project if it has already read this file. One model per path is what
-       * makes editing a file and navigating to it agree with each other --
-       * two models of the same path drift apart the moment you type.
-       */
-      const model = modelFor(path, language, r.content ?? "");
-      contentSubsRef.current.get(path)?.dispose();
-      contentSubsRef.current.set(path, model.onDidChangeContent(() => {
-        setDirty((prev) => (prev.has(path) ? prev : new Set(prev).add(path)));
-      }));
-      modelsRef.current.set(path, model);
+      try {
+        /*
+         * One model per path, from VS Code's text-model service, shared with
+         * every other pane showing the file. That is what makes an edit in
+         * one pane appear in the other, and navigation and editing agree.
+         */
+        const model = await claimModel(path);
+        if (language !== "plaintext" && model.getLanguageId() !== language) {
+          monaco.editor.setModelLanguage(model, language);
+        }
+        if (modelsRef.current.has(path)) {
+          // Two callers raced into the same file; the first model wins.
+          releaseModel(path, model.getValue());
+        } else {
+          modelsRef.current.set(path, model);
+          contentSubsRef.current.get(path)?.dispose();
+          contentSubsRef.current.set(path, await trackDocument(path, model));
+        }
+      } catch (e) {
+        doc.error = String((e as Error)?.message ?? e);
+      }
     }
     docsRef.current = new Map(docsRef.current).set(path, doc);
     setDocs(docsRef.current);
     return doc;
-  }, []);
+  }, [trackDocument]);
 
   /** Add a tab if it is not already there, and show it either way. */
   const showTab = useCallback((tab: Tab) => {
@@ -1023,15 +1139,54 @@ export function EditorPane(props: {
 
   // ---- history ------------------------------------------------------------
 
-  /** The commits that touched the active file, newest first. */
+  /**
+   * The active file's past: local history first, then the commits.
+   *
+   * Local history is every save in fove and every outside write -- an
+   * agent's edit is in there even though it was never committed. It works
+   * outside a repository too, where there are no commits to show.
+   */
   const openHistory = useCallback(async () => {
     const path = tabsRef.current.find((t) => t.key === activeKey)?.path;
-    if (!path || !root) return;
-    const rel = relativeTo(root, path);
-    if (!rel) { setNotice("not in this repository"); return; }
+    if (!path) return;
     setHistory([]);
+    setLocal([]);
+    void historyFor(path).then(setLocal, () => setLocal([]));
+    const rel = root ? relativeTo(root, path) : null;
+    if (!root || !rel) return;
     setHistory((await window.th.gitFileLog(root, rel, 100)) as Commit[]);
   }, [activeKey, root]);
+
+  const closeHistory = useCallback(() => { setHistory(null); setLocal(null); }, []);
+
+  /** A local history entry against the buffer, as an editable diff tab. */
+  const openLocalDiff = useCallback(async (path: string, entry: HistoryEntry) => {
+    closeHistory();
+    const text = await historyText(path, entry.id);
+    if (text === null) { setNotice("that history entry is gone"); return; }
+    await ensureDoc(path);
+    const rev = `local:${entry.id}`;
+    showTab({
+      kind: "diff", key: diffKey(path, rev), path, rev,
+      revLabel: `${entry.source.toLowerCase()}, ${agoExact(entry.timestamp)}`,
+      modLabel: "working tree", original: text, added: false, loading: false,
+    });
+  }, [closeHistory, ensureDoc, showTab]);
+
+  /**
+   * Put a local history entry back in the buffer.
+   *
+   * One undoable edit, and not saved: the buffer goes dirty with it, so you
+   * can look before you keep it, and ⌘Z takes it back out.
+   */
+  const restoreLocal = useCallback(async (path: string, entry: HistoryEntry) => {
+    closeHistory();
+    const text = await historyText(path, entry.id);
+    const model = modelsRef.current.get(path);
+    if (text === null || !model) { setNotice("that history entry is gone"); return; }
+    model.pushEditOperations([], [{ range: model.getFullModelRange(), text }], () => null);
+    setNotice(`restored the version from ${agoExact(entry.timestamp)}; save to keep it`);
+  }, [closeHistory]);
 
   /**
    * Open one commit's own change to this file, as a diff tab.
@@ -1051,6 +1206,64 @@ export function EditorPane(props: {
     });
   }, [openDiff]);
 
+  /** After any successful save: the bookkeeping, and the follow-up checks. */
+  const afterSave = useCallback((path: string, text: string) => {
+    lastSaved.set(path, text);
+    baseRef.current.set(path, text);
+    pendingMergeRef.current.delete(path);
+    void recordHistory(path, false).catch(() => {});
+    // Re-check after a save: the diagnostics the user just fixed should go.
+    void lint(path);
+    // Blame was suppressed while the buffer was dirty and now has a clean
+    // file to index against again.
+    if (blameOn) void loadBlame(path);
+  }, [lint, blameOn, loadBlame]);
+
+  /**
+   * Merge an outside change into a buffer whose save was refused.
+   *
+   * VS Code refused the save because the file changed on disk since the
+   * buffer last matched it -- an agent wrote to it, usually. Your edits and
+   * the disk's are combined against the text both started from. Edits to
+   * different lines merge and save on their own; edits to the same lines
+   * become conflict blocks in the buffer, and the save waits until you have
+   * picked a side in each. Neither side is ever dropped.
+   */
+  const mergeOutside = useCallback(async (path: string) => {
+    const model = modelsRef.current.get(path);
+    if (!model) return;
+    const name = path.split("/").pop() ?? path;
+    const disk = await readDisk(path);
+    const mine = model.getValue();
+    const base = baseRef.current.get(path) ?? disk.text;
+    const merged = threeWay(base, mine, disk.text);
+    baseRef.current.set(path, disk.text);
+    if (merged.text !== mine) {
+      // One undoable edit, so ⌘Z takes the merge back out.
+      model.pushEditOperations([], [{ range: model.getFullModelRange(), text: merged.text }], () => null);
+    }
+    if (merged.conflicts === 0) {
+      const ok = await saveText(path, { overwrite: true });
+      if (ok) afterSave(path, merged.text);
+      setNotice(ok
+        ? `${name} changed on disk; merged with your edits and saved`
+        : `${name}: merged with the change on disk, but the save failed`);
+      return;
+    }
+    pendingMergeRef.current.set(path, disk.mtime);
+    setNotice(`${name} changed on disk: ${merged.conflicts} conflict${merged.conflicts === 1 ? "" : "s"} `
+      + "with your edits. Keep one side of each <<<<<<< block, then save.");
+  }, [afterSave]);
+
+  useEffect(() => onSaveConflict((path) => {
+    if (!modelsRef.current.has(path) || merging.has(path)) return;
+    conflictSeenRef.current = true;
+    merging.add(path);
+    void mergeOutside(path)
+      .catch((e) => setNotice(`couldn't merge: ${String((e as Error)?.message ?? e)}`))
+      .finally(() => merging.delete(path));
+  }), [mergeOutside]);
+
   const save = useCallback(async () => {
     const tab = tabsRef.current.find((t) => t.key === activeKey);
     // A diff against a fixed revision has no working file behind it.
@@ -1059,35 +1272,60 @@ export function EditorPane(props: {
     const model = modelsRef.current.get(tab.path);
     if (!doc || !model || doc.readonly) return;
 
+    const pending = pendingMergeRef.current.get(doc.path);
+    if (pending !== undefined && hasConflictMarkers(model.getValue())) {
+      setNotice(`${doc.name}: keep one side of each <<<<<<< block before saving`);
+      return;
+    }
+
     if (formatOnSave) await formatBuffer(doc.path, model);
 
-    const content = model.getValue();
-    const r = (await window.th.fileWrite(doc.path, content, doc.mtimeMs)) as {
-      ok: boolean; mtimeMs?: number; error?: string; conflict?: boolean;
-    };
-    if (r.ok) {
-      docsRef.current = new Map(docsRef.current).set(doc.path, {
-        ...doc, mtimeMs: r.mtimeMs ?? doc.mtimeMs,
-      });
-      setDocs(docsRef.current);
-      setDirty((prev) => {
-        if (!prev.has(doc.path)) return prev;
-        const next = new Set(prev);
-        next.delete(doc.path);
-        return next;
-      });
-      setNotice(`saved ${doc.name}`);
-      // Re-check after a save: the diagnostics the user just fixed should go.
-      void lint(doc.path);
-      // The change bars are computed from the buffer, so they were already
-      // right; blame was suppressed while the buffer was dirty and now has a
-      // clean file to index against again.
-      if (blameOn) void loadBlame(doc.path);
-      setTimeout(() => setNotice(null), 1600);
-    } else {
-      setNotice(r.conflict ? `${doc.name} changed on disk — reopen to merge` : `save failed: ${r.error}`);
+    /*
+     * After a conflicted merge the buffer already holds what was on disk, so
+     * the save may go over it -- unless the disk moved again since, in which
+     * case the save is refused and merged again like any other.
+     */
+    let overwrite = false;
+    if (pending !== undefined) {
+      const disk = await readDisk(doc.path).catch(() => null);
+      overwrite = disk?.mtime === pending;
     }
-  }, [activeKey, lint, formatOnSave, formatBuffer, blameOn, loadBlame]);
+
+    conflictSeenRef.current = false;
+    const text = model.getValue();
+    const ok = await saveText(doc.path, { overwrite });
+    if (ok) {
+      afterSave(doc.path, text);
+      setNotice(`saved ${doc.name}`);
+      setTimeout(() => setNotice(null), 1600);
+    } else if (!conflictSeenRef.current) {
+      setNotice(`couldn't save ${doc.name}`);
+    }
+  }, [activeKey, formatOnSave, formatBuffer, afterSave]);
+
+  /*
+   * Reopen files that had unsaved edits when fove last quit.
+   *
+   * VS Code backed them up as you typed; resolving the file finds the backup
+   * and restores it, still unsaved. Each pane takes the ones under its own
+   * folder, once per session.
+   */
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      if (servicesError()) return;
+      const prefix = props.cwd.endsWith("/") ? props.cwd : `${props.cwd}/`;
+      const mine = (await backedUpPaths().catch(() => [] as string[]))
+        .filter((p) => p.startsWith(prefix) && !restored.has(p));
+      if (cancelled || mine.length === 0) return;
+      for (const p of mine) restored.add(p);
+      for (const p of mine) await openFile(p);
+      setNotice(`restored unsaved edits in ${mine.length} file${mine.length === 1 ? "" : "s"}`);
+    })();
+    return () => { cancelled = true; };
+    // Once per pane: the folder a pane opens on does not change under it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   /**
    * Close a tab, and the document behind it once no tab still points at it.
@@ -1158,15 +1396,13 @@ export function EditorPane(props: {
      */
     const doc = docsRef.current.get(from);
     if (modelsRef.current.has(from)) {
-      const moved = renameModel(from, to, doc?.language ?? languageForPath(to));
       contentSubsRef.current.get(from)?.dispose();
       contentSubsRef.current.delete(from);
       modelsRef.current.delete(from);
+      const moved = await renameModel(from, to);
       if (moved) {
         modelsRef.current.set(to, moved);
-        contentSubsRef.current.set(to, moved.onDidChangeContent(() => {
-          setDirty((prev) => (prev.has(to) ? prev : new Set(prev).add(to)));
-        }));
+        contentSubsRef.current.set(to, await trackDocument(to, moved));
       }
     }
     if (doc) {
@@ -1207,7 +1443,7 @@ export function EditorPane(props: {
       setActiveKey((k) => (k === t.key ? nextKey : k));
       return { ...t, key: nextKey, path: to };
     }));
-  }, [runFs]);
+  }, [runFs, trackDocument]);
 
   /** Delete to the system trash, after confirming -- the tabs go too. */
   const trashEntry = useCallback(async (path: string) => {
@@ -1306,6 +1542,7 @@ export function EditorPane(props: {
       glyphMargin: true,
     });
     editorRef.current = ed;
+    const sizing = followSize(ed, host);
 
     /**
      * Report the selection to Claude Code.
@@ -1379,6 +1616,7 @@ export function EditorPane(props: {
     return () => {
       clearTimeout(selTimer);
       clearTimeout(changeTimer);
+      sizing.dispose();
       for (const sub of subs) sub.dispose();
       // Detach first: the diff editor shares these models, and disposing one
       // out from under it leaves it holding a disposed model.
@@ -1435,6 +1673,9 @@ export function EditorPane(props: {
       setDiffStats({ added, removed });
     });
     diffRef.current = d;
+    // Lives as long as the diff editor, which is disposed with the pane.
+    const sizing = followSize(d, host);
+    d.onDidDispose(() => sizing.dispose());
     return d;
   }, []);
 
@@ -1673,11 +1914,17 @@ export function EditorPane(props: {
         const target = diffRef.current && editorRef.current?.getModel() === null
           ? diffRef.current.getModifiedEditor()
           : editorRef.current;
-        const action = target?.getAction("editor.action.quickOutline");
-        if (!action) return;
+        if (!target) return;
         e.preventDefault();
         e.stopPropagation();
-        void action.run();
+        /*
+         * VS Code's own symbol picker ("@" in quick open). Monaco's standalone
+         * quickOutline is not in VS Code's build, so asking for it by name
+         * finds nothing; the workbench command is the same picker, with
+         * symbols grouped by kind.
+         */
+        target.focus();
+        target.trigger("fove", "workbench.action.gotoSymbol", null);
       }
     };
     window.addEventListener("keydown", onKey, true);
@@ -1829,14 +2076,17 @@ export function EditorPane(props: {
               >
                 ◉
               </button>
-              <button
-                style={S.glyphBtn}
-                onClick={() => void openHistory()}
-                title="Commits that touched this file"
-              >
-                ⟲
-              </button>
             </>
+          )}
+          {/* Local history needs no repository, so this is not under `root`. */}
+          {active && (
+            <button
+              style={S.glyphBtn}
+              onClick={() => void openHistory()}
+              title="History of this file: local saves, outside changes, commits"
+            >
+              ⟲
+            </button>
           )}
           {activeEditable && (
             <button
@@ -1966,14 +2216,37 @@ export function EditorPane(props: {
         */}
       {history && active && (
         <>
-          <div style={S.scrim} onClick={() => setHistory(null)} />
+          <div style={S.scrim} onClick={closeHistory} />
           <div style={S.history}>
             <div style={S.historyHead}>
               <span>history of {active.path.split("/").pop()}</span>
               <span style={{ flex: 1 }} />
-              <button style={S.glyphBtn} onClick={() => setHistory(null)} title="Close (esc)">✕</button>
+              <button style={S.glyphBtn} onClick={closeHistory} title="Close (esc)">✕</button>
             </div>
-            {history.length === 0 && <div style={S.historyEmpty}>reading…</div>}
+            <div style={S.historySection}>local history</div>
+            {local !== null && local.length === 0 && (
+              <div style={S.historyEmpty}>nothing yet: saves and outside changes show up here</div>
+            )}
+            {local?.map((h) => (
+              <div
+                key={h.id}
+                style={S.historyRow}
+                onClick={() => void openLocalDiff(active.path, h)}
+                title="Compare with your buffer"
+              >
+                <span style={S.ellipsis}>{h.source}</span>
+                <span style={S.historyMeta}>{agoExact(h.timestamp)}</span>
+                <button
+                  style={S.glyphBtn}
+                  title="Put this version back in the buffer (not saved)"
+                  onClick={(e) => { e.stopPropagation(); void restoreLocal(active.path, h); }}
+                >
+                  restore
+                </button>
+              </div>
+            ))}
+            {root && <div style={S.historySection}>commits</div>}
+            {root && history.length === 0 && <div style={S.historyEmpty}>reading…</div>}
             {history.map((c) => (
               <div
                 key={c.oid}
@@ -2010,6 +2283,22 @@ export function EditorPane(props: {
  * about how you read a line, and a precise timestamp is longer to read for an
  * annotation that is meant to be glanced at.
  */
+/**
+ * "How long ago" for local history, where entries minutes apart matter.
+ *
+ * Blame's `ago` stops at the day, which is right for commits and useless for
+ * telling apart this morning's twenty saves.
+ */
+function agoExact(when: number): string {
+  const s = Math.floor((Date.now() - when) / 1000);
+  if (s < 45) return "just now";
+  if (s < 3600) return `${Math.max(1, Math.round(s / 60))} min ago`;
+  const d = new Date(when);
+  const time = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  if (s < 86_400 && d.getDate() === new Date().getDate()) return time;
+  return `${d.toLocaleDateString([], { month: "short", day: "numeric" })}, ${time}`;
+}
+
 function ago(when: number): string {
   const days = Math.floor((Date.now() - when) / 86_400_000);
   if (days <= 0) return "today";
@@ -2064,6 +2353,10 @@ const S: Record<string, React.CSSProperties> = {
     cursor: "pointer", lineHeight: "18px",
   },
   historyMeta: { color: C.faint, fontSize: 11, flexShrink: 0 },
+  historySection: {
+    color: C.faint, fontSize: 10, textTransform: "uppercase", letterSpacing: 0.6,
+    padding: "8px 9px 3px",
+  },
   historyEmpty: { color: C.faint, padding: "8px 9px", fontSize: 11 },
   sha: { fontFamily: 'Menlo, "SF Mono", monospace', color: "#d29922", fontSize: 11, flexShrink: 0 },
   toolbar: { display: "flex", alignItems: "center", gap: 4, padding: "3px 7px",

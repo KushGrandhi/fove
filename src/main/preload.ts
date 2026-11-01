@@ -69,6 +69,16 @@ const CH = {
   fsTrash: "fs:trash",
   fsWatch: "fs:watch",
   fsChanged: "fs:changed",
+  dfsStat: "dfs:stat",
+  dfsRead: "dfs:read",
+  dfsWrite: "dfs:write",
+  dfsReaddir: "dfs:readdir",
+  dfsMkdir: "dfs:mkdir",
+  dfsDelete: "dfs:delete",
+  dfsRename: "dfs:rename",
+  dfsWatch: "dfs:watch",
+  dfsUnwatch: "dfs:unwatch",
+  dfsChanged: "dfs:changed",
   wsRecipe: "ws:recipe",
   wsSaveRecipe: "ws:save-recipe",
   browserNavigate: "browser:navigate",
@@ -216,6 +226,28 @@ const api = {
     const h = (_e: unknown, dir: string): void => fn(dir);
     ipcRenderer.on(CH.fsChanged, h);
     return () => { ipcRenderer.removeListener(CH.fsChanged, h); };
+  },
+
+  /*
+   * The disk, for the editor's VS Code file service (`ide/diskProvider.ts`).
+   * Errors arrive with the node code at the start of the message.
+   */
+  dfsStat: (path: string): Promise<unknown> => ipcRenderer.invoke(CH.dfsStat, path),
+  dfsRead: (path: string): Promise<Uint8Array> => ipcRenderer.invoke(CH.dfsRead, path),
+  dfsWrite: (path: string, data: Uint8Array, opts: { create: boolean; overwrite: boolean }): Promise<void> =>
+    ipcRenderer.invoke(CH.dfsWrite, path, data, opts),
+  dfsReaddir: (path: string): Promise<[string, string][]> => ipcRenderer.invoke(CH.dfsReaddir, path),
+  dfsMkdir: (path: string): Promise<void> => ipcRenderer.invoke(CH.dfsMkdir, path),
+  dfsDelete: (path: string, recursive: boolean): Promise<void> =>
+    ipcRenderer.invoke(CH.dfsDelete, path, recursive),
+  dfsRename: (from: string, to: string, overwrite: boolean): Promise<void> =>
+    ipcRenderer.invoke(CH.dfsRename, from, to, overwrite),
+  dfsWatch: (path: string): void => ipcRenderer.send(CH.dfsWatch, path),
+  dfsUnwatch: (path: string): void => ipcRenderer.send(CH.dfsUnwatch, path),
+  onDfsChanged: (fn: (changes: { type: string; path: string }[]) => void): (() => void) => {
+    const h = (_e: unknown, changes: { type: string; path: string }[]): void => fn(changes);
+    ipcRenderer.on(CH.dfsChanged, h);
+    return () => { ipcRenderer.removeListener(CH.dfsChanged, h); };
   },
 
   /** The setup recipe for a repo, or a suggestion when it has none. */

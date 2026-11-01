@@ -162,7 +162,17 @@ foundation where needed:
    **Shipped ahead of the spike:** #21's app-level half — the keymap
    (`src/shared/keymap.ts`), the keybindings screen (`ui/Shortcuts.tsx`), and
    the new defaults. Editor-internal keys follow with #20.
-2. **State (#1–5).** Fixes the bugs that started this plan.
+2. **State (#1–5).** Fixes the bugs that started this plan. **Done.**
+   Verified in the running app (scripted over CDP): an open tab reloads on an
+   outside write; an unsaved edit survives one; save merges edits to
+   different lines and saves, and turns same-line edits into conflict blocks
+   it will not save until resolved; unsaved edits survive a quit; local
+   history lists saves and outside writes, each openable as a diff and
+   restorable. #2 uses conflict blocks in the buffer rather than VS Code's
+   merge editor, which needs workbench parts fove does not run yet.
+   **Found, not fixed:** ⌘-click to a definition in another TS file opens
+   the tab and then snaps back to the original file. The build before this
+   work does the same; it belongs to step 3, which replaces that code.
 3. **Language servers (#6–8, #12–14).** Switch to `monaco-languageclient`;
    delete `lspProviders.ts` and most of `tsProject.ts`.
 4. **Git (#15–18).**

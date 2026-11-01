@@ -14,6 +14,7 @@ import { useEffect, useRef } from "react";
 import * as monaco from "monaco-editor";
 import { C } from "../ui/Chrome.js";
 import { ensureTheme, languageForPath } from "./Editor.js";
+import { followSize } from "../ide/vscode.js";
 
 export interface DiffRequest {
   id: string;
@@ -50,6 +51,7 @@ export function DiffView(props: {
       scrollBeyondLastLine: false,
     });
     editorRef.current = diff;
+    const sizing = followSize(diff, host);
 
     let cancelled = false;
     void (async () => {
@@ -70,6 +72,7 @@ export function DiffView(props: {
 
     return () => {
       cancelled = true;
+      sizing.dispose();
       const m = diff.getModel();
       diff.dispose();
       m?.original.dispose();

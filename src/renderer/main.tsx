@@ -11,6 +11,7 @@ import { createRoot } from "react-dom/client";
 import { PopoutWindow } from "./PopoutWindow.js";
 import { App } from "./App.js";
 import type { ThApi } from "../main/preload.js";
+import { startServices } from "./ide/vscode.js";
 
 declare global {
   interface Window { th: ThApi }
@@ -20,6 +21,13 @@ declare global {
 // already running in the main process and is attached to, never restarted.
 const popoutPaneId = window.th.popoutPaneId();
 
-createRoot(document.getElementById("root")!).render(
-  popoutPaneId ? <PopoutWindow paneId={popoutPaneId} /> : <App />,
-);
+/*
+ * VS Code's editor services must exist before the first editor is created.
+ * Starting them never rejects -- a failure is reported inside the editor
+ * pane -- so terminals and agents come up either way.
+ */
+void startServices().then(() => {
+  createRoot(document.getElementById("root")!).render(
+    popoutPaneId ? <PopoutWindow paneId={popoutPaneId} /> : <App />,
+  );
+});

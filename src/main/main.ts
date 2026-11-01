@@ -53,6 +53,9 @@ import { IntentStore } from "./intentStore.js";
 import { HandoffService } from "./handoffService.js";
 import { FileTreeService } from "./files.js";
 import { WatchService } from "./watch.js";
+import {
+  FileWatcher, diskDelete, diskMkdir, diskRead, diskReaddir, diskRename, diskStat, diskWrite,
+} from "./diskFs.js";
 import { PopoutService } from "./popout.js";
 import { SearchService } from "./search.js";
 import { LintService } from "./lint.js";
@@ -165,6 +168,7 @@ app.on("window-all-closed", () => {
 app.on("before-quit", () => {
   ptys.killAll();
   watcher.closeAll();
+  fileWatcher.closeAll();
   popouts.closeAll();
   browsers.closeAll();
   void debugSession.stop();
@@ -378,6 +382,45 @@ ipcMain.handle(CH.fsRename, (_e, from: string, to: string) => tree.rename(from, 
 ipcMain.handle(CH.fsDuplicate, (_e, path: string) => tree.duplicate(path));
 ipcMain.handle(CH.fsTrash, (_e, path: string) => tree.trash(path));
 ipcMain.on(CH.fsWatch, (_e, dirs: string[]) => watcher.sync(dirs ?? []));
+
+// ---- the disk, for the editor's VS Code file service ----------------------
+ipcMain.handle(CH.dfsStat, (_e, path: string) => diskStat(path));
+ipcMain.handle(CH.dfsRead, (_e, path: string) => diskRead(path));
+ipcMain.handle(CH.dfsWrite, (_e, path: string, data: Uint8Array, opts: { create: boolean; overwrite: boolean }) =>
+  diskWrite(path, data, opts));
+ipcMain.handle(CH.dfsReaddir, (_e, path: string) => diskReaddir(path));
+ipcMain.handle(CH.dfsMkdir, (_e, path: string) => diskMkdir(path));
+ipcMain.handle(CH.dfsDelete, (_e, path: string, recursive: boolean) => diskDelete(path, recursive));
+ipcMain.handle(CH.dfsRename, (_e, from: string, to: string, overwrite: boolean) =>
+  diskRename(from, to, overwrite));
+
+const fileWatcher = new FileWatcher((changes) => send(CH.dfsChanged, changes));
+/*
+ * Which files each window asked to watch, so a window that closes without
+ * saying goodbye (a crash, a popout torn down) gives its watches back.
+ */
+const watchesBySender = new Map<number, Map<string, number>>();
+ipcMain.on(CH.dfsWatch, (e, path: string) => {
+  const id = e.sender.id;
+  let mine = watchesBySender.get(id);
+  if (!mine) {
+    mine = new Map();
+    watchesBySender.set(id, mine);
+    e.sender.once("destroyed", () => {
+      for (const [p, n] of watchesBySender.get(id) ?? []) for (let i = 0; i < n; i++) fileWatcher.remove(p);
+      watchesBySender.delete(id);
+    });
+  }
+  mine.set(path, (mine.get(path) ?? 0) + 1);
+  void fileWatcher.add(path);
+});
+ipcMain.on(CH.dfsUnwatch, (e, path: string) => {
+  const mine = watchesBySender.get(e.sender.id);
+  const n = mine?.get(path) ?? 0;
+  if (!mine || n === 0) return;
+  if (n === 1) mine.delete(path); else mine.set(path, n - 1);
+  fileWatcher.remove(path);
+});
 
 // ---- workspace recipes ----------------------------------------------------
 // ---- search and diagnostics -----------------------------------------------
