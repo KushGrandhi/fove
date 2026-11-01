@@ -102,7 +102,7 @@ export const DEPS: Dep[] = [
     label: "Pyright",
     severity: "feature",
     needs:
-      "go-to-definition, find-references, rename and hover in Python. Without it .py files keep highlighting, ruff diagnostics and the outline.",
+      "nothing, strictly: fove ships basedpyright for Python navigation and type errors. Install pyright to use the exact version your project and CI pin.",
     brew: "pyright",
     url: "https://microsoft.github.io/pyright/#/installation",
     // The rest of the table in main/lsp.ts, which the editor tries in this
@@ -118,7 +118,7 @@ export const DEPS: Dep[] = [
     bin: "ruff",
     label: "Ruff",
     severity: "feature",
-    needs: "Python lint findings, quick fixes and format on save.",
+    needs: "nothing, strictly: fove ships its own ruff for Python lint and fixes. Install ruff to use your project's pinned version, and for format on save.",
     brew: "ruff",
     url: "https://docs.astral.sh/ruff/installation/",
     versionArg: "--version",

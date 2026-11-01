@@ -250,11 +250,18 @@ client.** `ide/languageClients.ts` runs `monaco-languageclient` (that is,
 the process and relays LSP messages over IPC. TypeScript/JavaScript use
 `vtsls` (tsserver), bundled and run on Electron's own Node, so no Node install
 is needed. Python uses whichever pyright-family server is installed, plus
-`ruff server`. Servers start the first time a file of their language opens,
+`ruff server` -- and when the machine has neither, the copies fove ships:
+basedpyright (npm, run on Electron's Node) and the official ruff binary,
+which `scripts/fetch-ruff.mjs` downloads at pack time, pinned and checked
+against its published SHA-256. A new user gets Python navigation, type
+errors, lint, fixes and format on save with nothing installed. Format on
+save and the lint fallback use the bundled ruff too (`ruffCommand` in
+`main/lsp.ts`). Bumping ruff means changing the version and checksum in
+that script together. Servers start the first time a file of their language opens,
 one per repository root. Jumps to another file reach a pane through the
 editor-service override's `openEditor` (`ide/navigation.ts`).
 
-**vtsls ships as `extraResources`, not inside the asar.** A child process
+**vtsls, basedpyright and ruff ship as `extraResources`, not inside the asar.** A child process
 cannot run from inside an asar archive, and electron-builder's dependency
 pruning drops vtsls's nested TypeScript (it looks like fove's own dev-only
 `typescript`). So `package.json` copies the vtsls closure into

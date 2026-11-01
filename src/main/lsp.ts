@@ -87,6 +87,75 @@ function vtslsSpec(): Spec | null {
   };
 }
 
+/**
+ * The first of these paths that exists: the packaged app's Resources copy,
+ * then the development one.
+ */
+function firstExisting(packaged: string[], dev: () => string | null): string | null {
+  const resources = (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath;
+  if (resources) {
+    const p = join(resources, ...packaged);
+    if (existsSync(p)) return p;
+  }
+  try {
+    const d = dev();
+    return d && existsSync(d) ? d : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The servers fove ships, used when the machine has none of its own.
+ *
+ * A new user gets Python navigation, type errors and ruff's lint and format
+ * with nothing installed. A server the user installed still wins: it is the
+ * version their project and CI are pinned to.
+ *
+ *   - python: basedpyright (MIT), pure JavaScript, on Electron's Node
+ *   - ruff: the official ruff binary, fetched and checksummed at build time
+ *     by scripts/fetch-ruff.mjs
+ */
+function bundledSpec(kind: string): Spec | null {
+  if (kind === "python") {
+    const script = firstExisting(
+      ["basedpyright", "langserver.index.js"],
+      () => createRequire(__filename).resolve("basedpyright/langserver.index.js"),
+    );
+    return script
+      ? {
+          command: process.execPath,
+          args: [script, "--stdio"],
+          env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+          name: "basedpyright (bundled)",
+        }
+      : null;
+  }
+  if (kind === "ruff") {
+    // The repository's build/bin, in development: three levels up from the
+    // compiled dist/main/main/lsp.js, two from the source under test.
+    const bin = firstExisting(["bin", "ruff"], () =>
+      [join(__dirname, "..", "..", "..", "build", "bin", "ruff"), join(__dirname, "..", "..", "build", "bin", "ruff")]
+        .find((p) => existsSync(p)) ?? null);
+    return bin ? { command: bin, args: ["server"], name: "ruff (bundled)" } : null;
+  }
+  return null;
+}
+
+/**
+ * The ruff to run as a command (format on save, the lint fallback): the
+ * user's own if their shell has one, else the one fove ships. Null only in a
+ * development checkout that never ran scripts/fetch-ruff.mjs.
+ */
+export async function ruffCommand(): Promise<string | null> {
+  await ensureToolPath();
+  const onPath = await new Promise<boolean>((resolve) => {
+    execFile("ruff", ["--version"], { timeout: 5000 }, (err) => resolve(!err));
+  });
+  if (onPath) return "ruff";
+  return bundledSpec("ruff")?.command ?? null;
+}
+
 /** Splits a server's stdout into LSP messages. Exported for tests. */
 export class FrameReader {
   private buffer = Buffer.alloc(0);
@@ -222,13 +291,14 @@ export class LanguageServerHost {
   /** The installed binary that would serve a kind, or null. Exported for the doctor's sake. */
   async available(kind: string): Promise<string | null> {
     if (kind === "typescript") return vtslsSpec() ? "vtsls" : null;
-    return (await this.probe(kind))?.bin ?? null;
+    return (await this.probe(kind))?.bin ?? bundledSpec(kind)?.name ?? null;
   }
 
   private async specFor(kind: string): Promise<Spec | null> {
     if (kind === "typescript") return vtslsSpec();
     const found = await this.probe(kind);
-    return found ? { command: found.bin, args: found.args, name: found.bin } : null;
+    if (found) return { command: found.bin, args: found.args, name: found.bin };
+    return bundledSpec(kind);
   }
 
   /**

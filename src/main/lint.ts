@@ -20,6 +20,7 @@
 import { execFile } from "node:child_process";
 import { extname } from "node:path";
 import { ensureToolPath } from "./loginPath.js";
+import { ruffCommand } from "./lsp.js";
 
 export interface Diagnostic {
   /** 1-based, as both ruff and Monaco count. */
@@ -86,14 +87,18 @@ export class LintService {
     // user's shell can find it -- which a GUI-launched app cannot until this
     // runs. Without it the packaged app reports every Python file as clean.
     await ensureToolPath();
-    if (!(await this.has("ruff"))) return [];
-    return this.ruff(path, cwd);
+    this.ruffBin ??= await ruffCommand();
+    if (!this.ruffBin) return [];
+    return this.ruff(this.ruffBin, path, cwd);
   }
 
-  private ruff(path: string, cwd?: string): Promise<Diagnostic[]> {
+  /** The user's ruff, or fove's bundled one; null when neither exists. */
+  private ruffBin: string | null | undefined = undefined;
+
+  private ruff(bin: string, path: string, cwd?: string): Promise<Diagnostic[]> {
     return new Promise((resolve) => {
       execFile(
-        "ruff",
+        bin,
         ["check", "--output-format=json", "--force-exclude", "--", path],
         { cwd, maxBuffer: MAX_BUFFER, timeout: 20_000 },
         (_err, stdout) => {

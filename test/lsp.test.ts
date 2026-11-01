@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FrameReader, LanguageServerHost, SERVERS, frame } from "../src/main/lsp.js";
@@ -107,4 +107,45 @@ describe("LanguageServerHost", () => {
   test("the bundled TypeScript server is there", async () => {
     expect(await host.available("typescript")).toBe("vtsls");
   });
+
+  test("with no Python server installed, the bundled basedpyright serves", async () => {
+    const saved = SERVERS.python;
+    SERVERS.python = [{ bin: "definitely-not-a-real-server-xyz", args: [] }];
+    try {
+      expect(await host.available("python")).toBe("basedpyright (bundled)");
+    } finally {
+      SERVERS.python = saved;
+    }
+  });
+
+  test("with no ruff installed, the bundled ruff serves (once fetched)", async () => {
+    const saved = SERVERS.ruff;
+    SERVERS.ruff = [{ bin: "definitely-not-a-real-server-xyz", args: [] }];
+    try {
+      // build/bin/ruff exists after `node scripts/fetch-ruff.mjs`, which
+      // every pack and dist runs.
+      const fetched = existsSync(join(__dirname, "..", "build", "bin", "ruff"));
+      expect(await host.available("ruff")).toBe(fetched ? "ruff (bundled)" : null);
+    } finally {
+      SERVERS.ruff = saved;
+    }
+  });
+
+  test("the bundled basedpyright really starts and answers initialize", async () => {
+    const saved = SERVERS.python;
+    SERVERS.python = [{ bin: "definitely-not-a-real-server-xyz", args: [] }];
+    try {
+      const r = await host.start("bp", "python", dir);
+      expect(r).toEqual({ ok: true, name: "basedpyright (bundled)" });
+      host.send("bp", {
+        jsonrpc: "2.0", id: 7, method: "initialize",
+        params: { processId: null, rootUri: null, capabilities: {} },
+      });
+      await waitFor(() => messages.some((m) => m.id === "bp" && m.msg.id === 7), 20000);
+      const reply = messages.find((m) => m.id === "bp" && m.msg.id === 7)!.msg as { result?: { capabilities?: object } };
+      expect(reply.result?.capabilities).toBeTruthy();
+    } finally {
+      SERVERS.python = saved;
+    }
+  }, 30000);
 });
