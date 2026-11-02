@@ -22,7 +22,10 @@ import { SessionCard } from "./ui/widgets.js";
 import { TeammateBar, TeammateView, useTeammates } from "./ui/Teammates.js";
 import { C, Divider, LayoutMenu, ToolButton, ToolMenu } from "./ui/Chrome.js";
 import { Palette, type PaletteItem } from "./ui/Palette.js";
+import { editorCommands } from "./ide/editorCommands.js";
 import { Spotlight } from "./ui/Spotlight.js";
+import { Shortcuts } from "./ui/Shortcuts.js";
+import { keymap, useKeymap } from "./ui/keymap-store.js";
 import { Keel, type TurnReview } from "./ui/Keel.js";
 import { KeelWorkspace, type WorklistWire, type CardWire } from "./ui/KeelWorkspace.js";
 import { KeelIntents, type IntentsWire } from "./ui/KeelIntents.js";
@@ -276,6 +279,12 @@ export function App() {
   }, [tabs, activeTabId]);
 
   const active = tabs.find((t) => t.id === activeTabId);
+  /** The focused pane's kind, read by the key listener to pick a scope. */
+  const focusedKindRef = useRef<PaneKind | undefined>(undefined);
+  focusedKindRef.current = active?.panes[active.focusedPaneId]?.kind;
+  /** Re-render hints when a binding changes. */
+  useKeymap();
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
 
   const updateTab = useCallback((id: string, fn: (t: Tab) => Tab) => {
     setTabs((prev) => prev.map((t) => (t.id === id ? fn(t) : t)));
@@ -424,59 +433,58 @@ export function App() {
   const openPaletteRef = useRef<() => void>(() => {});
   const openSpotlightRef = useRef<() => void>(() => {});
 
+  /**
+   * What each command does, refreshed every render (assigned further down,
+   * once everything it calls is declared). The key listener below is
+   * registered once and reads this, so it always runs the current closures.
+   */
+  const actionsRef = useRef<Record<string, () => void>>({});
+
+  /*
+   * App-wide shortcuts, looked up in the keymap (`shared/keymap.ts`) instead
+   * of hard-coded, so the keybindings screen can change any of them.
+   *
+   * A focused terminal pane gets its own scope first -- iTerm's ⌘D splits
+   * from there. The editor pane handles its own scope in the capture phase,
+   * so by the time a key reaches here the editor has already passed on it.
+   * Anything unbound falls through untouched, which is how ⌘M reaches macOS's
+   * Minimize again.
+   */
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      const mod = e.metaKey || e.ctrlKey;
-      if (!mod) return;
-      // Splits mirror the muscle memory of iTerm/tmux.
-      if (e.key === "d" && !e.shiftKey) { e.preventDefault(); doSplit("row"); }
-      else if (e.key === "D" || (e.key === "d" && e.shiftKey)) { e.preventDefault(); doSplit("column"); }
-      else if (e.key === "w") { e.preventDefault(); doClosePane(); }
-      else if (e.key === "t") { e.preventDefault(); void addTab(); }
-      else if (e.key === "j") { e.preventDefault(); doSplit("column", "claude"); }
-      else if (e.key === "g") { e.preventDefault(); doSplit("row", "git"); }
-      else if (e.key === "e") { e.preventDefault(); doSplit("row", "editor"); }
-      else if (e.key === "r") { e.preventDefault(); doSplit("row", "agents"); }
-      else if (e.key === "m") { e.preventDefault(); setPickerOpen(true); }
-      else if (e.key === "k") { e.preventDefault(); doSplit("row", "config"); }
-      else if (e.key === "b") { e.preventDefault(); doSplit("row", "browser"); }
+      if (!(e.metaKey || e.ctrlKey || e.altKey) || keymap.isSuspended()) return;
       /*
-       * ⌘⇧F opens Spotlight.
-       *
-       * This binding used to split a search *pane*, and that is the whole
-       * reason Spotlight was hard to find: the key everyone's hands already
-       * press for "search" kept rearranging the workspace instead. The pane
-       * still exists and the palette still opens it, for the regex and glob
-       * toggles Spotlight deliberately does not carry.
+       * A plain text field (the palette, Spotlight, a commit message) keeps
+       * its keys. The editor and the terminals are text fields too, but they
+       * are where shortcuts are pressed most, so they do not count.
        */
-      else if (e.key === "f" && e.shiftKey) { e.preventDefault(); openSpotlightRef.current(); }
-      /*
-       * ⌘L disabled for now, deliberately left in place rather than deleted.
-       *
-       * Keel itself, its palette entry and `openKeel` are all untouched --
-       * only the shortcut is off, so re-enabling is uncommenting this line.
-       */
-      // else if (e.key === "l") { e.preventDefault(); openKeelRef.current(); }
-      /*
-       * ⌘⇧O reaches Spotlight too, next to ⌘O's "go to a worktree".
-       *
-       * Unless an editor pane has the focus: there it means "go to a symbol
-       * in this file", which is what it means in every other editor. The pane
-       * takes it in the capture phase and stops this handler seeing it.
-       */
-      else if (e.key === "O" || (e.key === "o" && e.shiftKey)) { e.preventDefault(); openSpotlightRef.current(); }
-      else if (e.key === "o") { e.preventDefault(); openPaletteRef.current(); }
-      else if (e.key === "p" && e.shiftKey) { e.preventDefault(); togglePin(activeTabId); }
-      else if (e.key === "p") { e.preventDefault(); if (active) togglePanePin(active.focusedPaneId); }
-      else if (e.key === "Enter") { e.preventDefault(); doSplit("row", "claude"); }
-      else if (/^[1-9]$/.test(e.key)) {
-        const i = Number(e.key) - 1;
-        if (tabs[i]) { e.preventDefault(); setActiveTabId(tabs[i]!.id); }
-      }
+      const t = e.target as HTMLElement | null;
+      const field = t?.closest?.("input, textarea, [contenteditable='true']");
+      if (field && !field.closest(".monaco-editor, .xterm")) return;
+      // Inside the editor, the editor's own keys come first (the ones listed
+      // under "Editing (VS Code)" and "Editor pane" in Shortcuts).
+      if (t?.closest?.(".monaco-editor") && keymap.match(e, "editor")) return;
+      const focusedKind = focusedKindRef.current;
+      const inTerminal = focusedKind === "shell" || focusedKind === "claude";
+      const id = (inTerminal ? keymap.match(e, "terminal") : undefined) ?? keymap.match(e, "app");
+      const run = id ? actionsRef.current[id] : undefined;
+      if (!run) return;
+      e.preventDefault();
+      e.stopPropagation();
+      run();
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [doSplit, doClosePane, addTab, tabs, togglePin, activeTabId, active, togglePanePin]);
+    /*
+     * Capture phase, so fove's shortcuts win over the editor's own: VS Code's
+     * keybindings claim ⌘P and ⌘⇧P inside the editor, and in the bubble
+     * phase they never got here. On `document`, not `window`: the editor
+     * pane's own keys (⌘S, ⌘W on a file tab) listen on `window`, and capture
+     * reaches `window` first whatever order the listeners were added in --
+     * editor panes mount after the app, so registration order would put
+     * this one first and ⌘W would close the pane instead of the tab.
+     */
+    document.addEventListener("keydown", onKey, true);
+    return () => document.removeEventListener("keydown", onKey, true);
+  }, []);
 
   /**
    * Keel: the review overlay.
@@ -961,23 +969,24 @@ export function App() {
         badges: [{ text: "Alpha", tone: C.red }],
         run: () => openKeelRef.current(),
       },
-      cmd("cmd:claude", "New Claude pane", "⌘↵", () => doSplit("row", "claude")),
-      cmd("cmd:shell", "New shell pane", "", () => doSplit("row", "shell")),
-      cmd("cmd:editor", "Editor", "⌘E", () => doSplit("row", "editor")),
-      cmd("cmd:git", "Git", "⌘G", () => doSplit("row", "git")),
-      cmd("cmd:agents", "Agents", "⌘R", () => doSplit("row", "agents")),
-      cmd("cmd:search", "Search the codebase", "⌘⇧F", () => setSpotlightOpen(true)),
+      cmd("cmd:claude", "New Claude pane", keymap.hint("pane.claude"), () => doSplit("row", "claude")),
+      cmd("cmd:shell", "New shell pane", keymap.hint("pane.shell"), () => doSplit("row", "shell")),
+      cmd("cmd:editor", "Editor", keymap.hint("pane.editor"), () => doSplit("row", "editor")),
+      cmd("cmd:git", "Git", keymap.hint("pane.git"), () => doSplit("row", "git")),
+      cmd("cmd:agents", "Agents", keymap.hint("pane.agents"), () => doSplit("row", "agents")),
+      cmd("cmd:search", "Go to a file, or search the codebase", keymap.hint("go.quickOpen"), () => setSpotlightOpen(true)),
       // The pane is still reachable, for the regex, case and glob toggles.
-      cmd("cmd:searchpane", "Search in a pane (regex, globs)", "", () => doSplit("row", "search")),
-      cmd("cmd:browser", "Browser", "⌘B", () => doSplit("row", "browser")),
-      cmd("cmd:debug", "Debugger", "", () => doSplit("row", "debug")),
-      cmd("cmd:config", "Open config", "⌘K", () => doSplit("row", "config")),
-      cmd("cmd:model", "Switch model", "⌘M", () => setPickerOpen(true)),
-      cmd("cmd:split", "Split right", "⌘D", () => doSplit("row")),
-      cmd("cmd:splitDown", "Split down", "⌘⇧D", () => doSplit("column")),
-      cmd("cmd:folder", "Open a folder as a workspace", "⌘T", () => void addTab()),
-      cmd("cmd:closePane", "Close pane", "⌘W", doClosePane),
-      cmd("cmd:pinTab", "Pin or unpin this workspace", "⌘⇧P", () => togglePin(activeTabId)),
+      cmd("cmd:searchpane", "Search in a pane (regex, globs)", keymap.hint("pane.search"), () => doSplit("row", "search")),
+      cmd("cmd:browser", "Browser", keymap.hint("pane.browser"), () => doSplit("row", "browser")),
+      cmd("cmd:debug", "Debugger", keymap.hint("pane.debug"), () => doSplit("row", "debug")),
+      cmd("cmd:config", "Open config", keymap.hint("pane.config"), () => doSplit("row", "config")),
+      cmd("cmd:model", "Switch model", keymap.hint("go.model"), () => setPickerOpen(true)),
+      cmd("cmd:split", "Split right", keymap.hint("ws.splitRight"), () => doSplit("row")),
+      cmd("cmd:splitDown", "Split down", keymap.hint("ws.splitDown"), () => doSplit("column")),
+      cmd("cmd:folder", "Open a folder as a workspace", keymap.hint("ws.newTab"), () => void addTab()),
+      cmd("cmd:closePane", "Close pane", keymap.hint("ws.closePane"), doClosePane),
+      cmd("cmd:shortcuts", "Keyboard shortcuts", keymap.hint("go.shortcuts"), () => setShortcutsOpen(true)),
+      cmd("cmd:pinTab", "Pin or unpin this workspace", keymap.hint("ws.pinTab"), () => togglePin(activeTabId)),
       cmd("cmd:theme", "Next theme", "", () => {
         const i = THEMES.findIndex((t) => t.id === themeId);
         setThemeId(THEMES[(i + 1) % THEMES.length]!.id);
@@ -985,9 +994,9 @@ export function App() {
     );
     if (active) {
       items.push(
-        cmd("cmd:pinPane", panePins.has(active.focusedPaneId) ? "Unpin pane" : "Pin pane", "⌘P",
+        cmd("cmd:pinPane", panePins.has(active.focusedPaneId) ? "Unpin pane" : "Pin pane", keymap.hint("ws.pinPane"),
           () => togglePanePin(active.focusedPaneId)),
-        cmd("cmd:popout", popped.has(active.focusedPaneId) ? "Put pane back" : "Pop pane out", "",
+        cmd("cmd:popout", popped.has(active.focusedPaneId) ? "Put pane back" : "Pop pane out", keymap.hint("ws.popout"),
           () => {
             const spec = active.panes[active.focusedPaneId];
             togglePopout(active.focusedPaneId, spec?.title || spec?.kind || "pane");
@@ -1122,13 +1131,55 @@ export function App() {
   }, []);
 
   const [paletteOpen, setPaletteOpen] = useState(false);
+  /** The focused editor's own commands, read each time the palette opens. */
+  const [editorItems, setEditorItems] = useState<PaletteItem[]>([]);
   const openPalette = useCallback(() => {
     // Refresh on open so the counts are current rather than whatever they were
     // when the tab was last switched.
     if (active?.cwd) void loadWorktrees(active.cwd);
+    setEditorItems([]);
+    void editorCommands().then((cmds) => setEditorItems(cmds.map((c) => ({
+      id: `editor:${c.id}`,
+      label: c.label,
+      icon: "✎",
+      hint: c.key,
+      // After fove's own commands for an empty query; typing finds them.
+      priority: -1,
+      run: c.run,
+    }))));
     setPaletteOpen(true);
   }, [active?.cwd, loadWorktrees]);
   openPaletteRef.current = openPalette;
+
+  actionsRef.current = {
+    "pane.editor": () => doSplit("row", "editor"),
+    "pane.git": () => doSplit("row", "git"),
+    "pane.debug": () => doSplit("row", "debug"),
+    "pane.search": () => doSplit("row", "search"),
+    "pane.config": () => doSplit("row", "config"),
+    "pane.claude": () => doSplit("row", "claude"),
+    "pane.agents": () => doSplit("row", "agents"),
+    "pane.browser": () => doSplit("row", "browser"),
+    "pane.shell": () => doSplit("row", "shell"),
+    "go.quickOpen": () => setSpotlightOpen(true),
+    "go.palette": openPalette,
+    "go.model": () => setPickerOpen(true),
+    "go.shortcuts": () => setShortcutsOpen(true),
+    "ws.newTab": () => void addTab(),
+    "ws.closePane": doClosePane,
+    "ws.splitRight": () => doSplit("row"),
+    "ws.splitDown": () => doSplit("column"),
+    "ws.pinPane": () => { if (active) togglePanePin(active.focusedPaneId); },
+    "ws.pinTab": () => togglePin(activeTabId),
+    "ws.popout": () => {
+      if (!active) return;
+      const spec = active.panes[active.focusedPaneId];
+      togglePopout(active.focusedPaneId, spec?.title || spec?.kind || "pane");
+    },
+    "term.splitRight": () => doSplit("row"),
+    "term.splitDown": () => doSplit("column"),
+    ...Object.fromEntries(tabs.slice(0, 9).map((t, i) => [`tab.${i + 1}`, () => setActiveTabId(t.id)])),
+  };
   openKeelRef.current = openKeel;
 
   // Tell the main process which workspaces and editors are open, so the IDE
@@ -1205,39 +1256,40 @@ export function App() {
           label="AI"
           icon="✳"
           items={[
-            { label: "Claude", hint: "⌘↵", icon: "✳", onSelect: () => doSplit("row", "claude") },
-            { label: "Agents", hint: "⌘R", icon: "◉", onSelect: () => doSplit("row", "agents") },
-            { label: "Model", hint: "⌘M", icon: "◈", onSelect: () => setPickerOpen(true) },
+            { label: "Claude", hint: keymap.hint("pane.claude"), icon: "✳", onSelect: () => doSplit("row", "claude") },
+            { label: "Agents", hint: keymap.hint("pane.agents"), icon: "◉", onSelect: () => doSplit("row", "agents") },
+            { label: "Model", hint: keymap.hint("go.model"), icon: "◈", onSelect: () => setPickerOpen(true) },
           ]}
         />
         <ToolMenu
           label="Dev"
           icon="◧"
           items={[
-            { label: "Editor", hint: "⌘E", icon: "◧", onSelect: () => doSplit("row", "editor") },
-            { label: "Shell", icon: "❯", onSelect: () => doSplit("row", "shell") },
-            { label: "Git", hint: "⌘G", icon: "⎇", onSelect: () => doSplit("row", "git") },
-            { label: "Search", hint: "⌘⇧F", icon: "⌕", onSelect: () => setSpotlightOpen(true) },
-            { label: "Browser", hint: "⌘B", icon: "◍", onSelect: () => doSplit("row", "browser") },
-            { label: "Debug", icon: "◆", onSelect: () => doSplit("row", "debug") },
-            { label: "Config", hint: "⌘K", icon: "⚙", onSelect: () => doSplit("row", "config") },
+            { label: "Editor", hint: keymap.hint("pane.editor"), icon: "◧", onSelect: () => doSplit("row", "editor") },
+            { label: "Shell", hint: keymap.hint("pane.shell"), icon: "❯", onSelect: () => doSplit("row", "shell") },
+            { label: "Git", hint: keymap.hint("pane.git"), icon: "⎇", onSelect: () => doSplit("row", "git") },
+            { label: "Search", hint: keymap.hint("go.quickOpen"), icon: "⌕", onSelect: () => setSpotlightOpen(true) },
+            { label: "Browser", hint: keymap.hint("pane.browser"), icon: "◍", onSelect: () => doSplit("row", "browser") },
+            { label: "Debug", hint: keymap.hint("pane.debug"), icon: "◆", onSelect: () => doSplit("row", "debug") },
+            { label: "Config", hint: keymap.hint("pane.config"), icon: "⚙", onSelect: () => doSplit("row", "config") },
           ]}
         />
         <ToolMenu
           label="Workspace"
           icon="▦"
           items={[
-            { label: "Split right", hint: "⌘D", icon: "▊▊", onSelect: () => doSplit("row") },
-            { label: "Split down", hint: "⌘⇧D", icon: "▤", onSelect: () => doSplit("column") },
+            { label: "Split right", hint: keymap.hint("ws.splitRight"), icon: "▊▊", onSelect: () => doSplit("row") },
+            { label: "Split down", hint: keymap.hint("ws.splitDown"), icon: "▤", onSelect: () => doSplit("column") },
             {
               label: active && panePins.has(active.focusedPaneId) ? "Unpin pane" : "Pin pane",
-              hint: "⌘P",
+              hint: keymap.hint("ws.pinPane"),
               icon: active && panePins.has(active.focusedPaneId) ? "📌" : "⚲",
               onSelect: () => { if (active) togglePanePin(active.focusedPaneId); },
               disabled: !active,
             },
-            { label: "Open folder…", hint: "⌘T", icon: "＋", onSelect: () => void addTab() },
-            { label: "Go to…", hint: "⌘O", icon: "⎇", onSelect: openPalette },
+            { label: "Open folder…", hint: keymap.hint("ws.newTab"), icon: "＋", onSelect: () => void addTab() },
+            { label: "Go to…", hint: keymap.hint("go.palette"), icon: "⎇", onSelect: openPalette },
+            { label: "Keyboard shortcuts…", hint: keymap.hint("go.shortcuts"), icon: "⌨", onSelect: () => setShortcutsOpen(true) },
             {
               // A submenu, not a cycling label: with five themes, cycling
               // means up to four wrong repaints on the way to the one you
@@ -1288,7 +1340,7 @@ export function App() {
         <div style={S.grow} />
         <ToolButton
           label="Close pane"
-          hint="⌘W"
+          hint={keymap.hint("ws.closePane")}
           icon="✕"
           danger
           onClick={doClosePane}
@@ -1304,11 +1356,13 @@ export function App() {
 
       {paletteOpen && (
         <Palette
-          items={paletteItems}
+          items={editorItems.length ? [...paletteItems, ...editorItems] : paletteItems}
           empty={worktrees.length === 0 ? "not a git repository" : "nothing here"}
           onClose={() => setPaletteOpen(false)}
         />
       )}
+
+      {shortcutsOpen && <Shortcuts onClose={() => setShortcutsOpen(false)} />}
 
       {spotlightOpen && active && (
         <Spotlight
@@ -1633,7 +1687,11 @@ export function App() {
         <Divider />
         <span style={{ color: C.faint }}>{tabs.length} workspace{tabs.length === 1 ? "" : "s"}</span>
         <div style={S.grow} />
-        <span style={{ color: C.faint }}>⌘⇧P pins a workspace</span>
+        <span style={{ color: C.faint }}>
+          {keymap.hint("ws.pinTab")
+            ? `${keymap.hint("ws.pinTab")} pins a workspace`
+            : `pin a workspace from the palette (${keymap.hint("go.palette") || "toolbar"})`}
+        </span>
       </div>
     </div>
   );

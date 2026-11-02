@@ -117,3 +117,10 @@ describe("counting", () => {
     expect(count).toBe(0);
   });
 });
+
+describe("fuzzy path candidates", () => {
+  it("hands back every path holding the letters in order, ignoring spaces", async () => {
+    const { matches } = await search({ query: "nest srv", fuzzyPaths: true });
+    expect(matches.filter((m) => m.isPath).map((m) => m.path)).toEqual(["nested/server.ts"]);
+  });
+});

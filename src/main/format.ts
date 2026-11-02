@@ -23,6 +23,7 @@ import { execFile } from "node:child_process";
 import { access, constants } from "node:fs/promises";
 import { dirname, extname, join } from "node:path";
 import { ensureToolPath } from "./loginPath.js";
+import { ruffCommand } from "./lsp.js";
 
 const MAX_BUFFER = 16 * 1024 * 1024;
 /** A formatter that has not answered by now is in a state nobody's save should wait on. */
@@ -71,7 +72,8 @@ function pipe(
 export class FormatService {
   /** Resolved binaries, per directory walked from. Formatters do not move mid-session. */
   private readonly prettier = new Map<string, string | null>();
-  private ruff: boolean | null = null;
+  /** The ruff to run, once found: the user's own, or fove's bundled one. */
+  private ruff: string | null | undefined = undefined;
 
   /**
    * The project's own prettier, found by walking up from the file.
@@ -102,11 +104,8 @@ export class FormatService {
     return found;
   }
 
-  private async hasRuff(): Promise<boolean> {
-    if (this.ruff !== null) return this.ruff;
-    this.ruff = await new Promise<boolean>((resolve) => {
-      execFile("ruff", ["--version"], { timeout: 5000 }, (err) => resolve(!err));
-    });
+  private async findRuff(): Promise<string | null> {
+    if (this.ruff === undefined) this.ruff = await ruffCommand();
     return this.ruff;
   }
 
@@ -125,8 +124,9 @@ export class FormatService {
     await ensureToolPath();
 
     if (ext === ".py") {
-      if (!(await this.hasRuff())) return { content: null };
-      const r = await pipe("ruff", ["format", "--stdin-filename", path, "-"], content, from);
+      const ruff = await this.findRuff();
+      if (!ruff) return { content: null };
+      const r = await pipe(ruff, ["format", "--stdin-filename", path, "-"], content, from);
       if ("error" in r) return { content: null, by: "ruff", error: r.error };
       return { content: r.stdout, by: "ruff" };
     }

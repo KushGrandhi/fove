@@ -39,6 +39,7 @@ const CH = {
   gitCommits: "git:commits",
   gitCommitParents: "git:commit-parents",
   keelTurn: "keel:turn",
+  keelTurnOriginals: "keel:turn-originals",
   keelBegin: "keel:begin",
   keelWorklist: "keel:worklist",
   keelCard: "keel:card",
@@ -69,6 +70,16 @@ const CH = {
   fsTrash: "fs:trash",
   fsWatch: "fs:watch",
   fsChanged: "fs:changed",
+  dfsStat: "dfs:stat",
+  dfsRead: "dfs:read",
+  dfsWrite: "dfs:write",
+  dfsReaddir: "dfs:readdir",
+  dfsMkdir: "dfs:mkdir",
+  dfsDelete: "dfs:delete",
+  dfsRename: "dfs:rename",
+  dfsWatch: "dfs:watch",
+  dfsUnwatch: "dfs:unwatch",
+  dfsChanged: "dfs:changed",
   wsRecipe: "ws:recipe",
   wsSaveRecipe: "ws:save-recipe",
   browserNavigate: "browser:navigate",
@@ -113,10 +124,12 @@ const CH = {
   searchDone: "search:done",
   lintCheck: "lint:check",
   formatRun: "format:run",
-  projectSources: "project:sources",
-  lspAvailable: "lsp:available",
-  lspRequest: "lsp:request",
-  lspNotify: "lsp:notify",
+  lsStart: "ls:start",
+  lsSend: "ls:send",
+  lsStop: "ls:stop",
+  lsMessage: "ls:message",
+  lsExit: "ls:exit",
+  lsPythonPath: "ls:python-path",
   claudeSnapshot: "claude:snapshot",
   claudeSessions: "claude:sessions",
   skillsList: "skills:list",
@@ -216,6 +229,28 @@ const api = {
     const h = (_e: unknown, dir: string): void => fn(dir);
     ipcRenderer.on(CH.fsChanged, h);
     return () => { ipcRenderer.removeListener(CH.fsChanged, h); };
+  },
+
+  /*
+   * The disk, for the editor's VS Code file service (`ide/diskProvider.ts`).
+   * Errors arrive with the node code at the start of the message.
+   */
+  dfsStat: (path: string): Promise<unknown> => ipcRenderer.invoke(CH.dfsStat, path),
+  dfsRead: (path: string): Promise<Uint8Array> => ipcRenderer.invoke(CH.dfsRead, path),
+  dfsWrite: (path: string, data: Uint8Array, opts: { create: boolean; overwrite: boolean }): Promise<void> =>
+    ipcRenderer.invoke(CH.dfsWrite, path, data, opts),
+  dfsReaddir: (path: string): Promise<[string, string][]> => ipcRenderer.invoke(CH.dfsReaddir, path),
+  dfsMkdir: (path: string): Promise<void> => ipcRenderer.invoke(CH.dfsMkdir, path),
+  dfsDelete: (path: string, recursive: boolean): Promise<void> =>
+    ipcRenderer.invoke(CH.dfsDelete, path, recursive),
+  dfsRename: (from: string, to: string, overwrite: boolean): Promise<void> =>
+    ipcRenderer.invoke(CH.dfsRename, from, to, overwrite),
+  dfsWatch: (path: string): void => ipcRenderer.send(CH.dfsWatch, path),
+  dfsUnwatch: (path: string): void => ipcRenderer.send(CH.dfsUnwatch, path),
+  onDfsChanged: (fn: (changes: { type: string; path: string }[]) => void): (() => void) => {
+    const h = (_e: unknown, changes: { type: string; path: string }[]): void => fn(changes);
+    ipcRenderer.on(CH.dfsChanged, h);
+    return () => { ipcRenderer.removeListener(CH.dfsChanged, h); };
   },
 
   /** The setup recipe for a repo, or a suggestion when it has none. */
@@ -323,34 +358,27 @@ const api = {
     return () => { ipcRenderer.removeListener(CH.searchDone, h); };
   },
   /** Diagnostics for one file, for languages Monaco cannot check itself. */
-  /**
-   * The language server that serves a language on this machine, or null when
-   * none is installed -- which is the normal case and not an error.
+  /*
+   * Language servers, for the editor's VS Code language client
+   * (`ide/languageClients.ts`). Main starts the process and passes LSP
+   * messages through untouched; `id` names one client's connection.
    */
-  lspAvailable: (language: string): Promise<string | null> =>
-    ipcRenderer.invoke(CH.lspAvailable, language),
-  /** An LSP request, or null when there is no server to ask. */
-  lspRequest: (root: string, language: string, method: string, params: unknown): Promise<unknown> =>
-    ipcRenderer.invoke(CH.lspRequest, root, language, method, params),
-  /**
-   * An LSP notification, e.g. keeping the server told about an open buffer.
-   *
-   * Awaitable even though a notification expects no reply: the caller needs to
-   * know the server has the buffer before it asks anything about it.
-   */
-  lspNotify: (root: string, language: string, method: string, params: unknown): Promise<void> =>
-    ipcRenderer.invoke(CH.lspNotify, root, language, method, params),
-  /**
-   * Every TypeScript/JavaScript source in the project, plus the declarations
-   * of its direct dependencies, for the editor's language service to build a
-   * program out of. Capped -- `skipped` says how much did not fit.
-   */
-  projectSources: (root: string): Promise<{
-    files: { path: string; content: string }[];
-    skipped: number;
-    hasTsConfig: boolean;
-    tsconfig: { path: string; text: string } | null;
-  }> => ipcRenderer.invoke(CH.projectSources, root),
+  lsStart: (id: string, kind: string, root: string): Promise<{ ok: boolean; name?: string; reason?: string }> =>
+    ipcRenderer.invoke(CH.lsStart, id, kind, root),
+  lsSend: (id: string, msg: unknown): void => ipcRenderer.send(CH.lsSend, id, msg),
+  lsStop: (id: string): void => ipcRenderer.send(CH.lsStop, id),
+  onLsMessage: (fn: (id: string, msg: unknown) => void): (() => void) => {
+    const h = (_e: unknown, id: string, msg: unknown): void => fn(id, msg);
+    ipcRenderer.on(CH.lsMessage, h);
+    return () => { ipcRenderer.removeListener(CH.lsMessage, h); };
+  },
+  onLsExit: (fn: (id: string, info: { code: number | null; stderr: string }) => void): (() => void) => {
+    const h = (_e: unknown, id: string, info: { code: number | null; stderr: string }): void => fn(id, info);
+    ipcRenderer.on(CH.lsExit, h);
+    return () => { ipcRenderer.removeListener(CH.lsExit, h); };
+  },
+  /** The Python a project's dependencies are installed in, for pyright. */
+  lsPythonPath: (root: string): Promise<string | null> => ipcRenderer.invoke(CH.lsPythonPath, root),
   /**
    * Format a buffer with the project's own formatter, if it has one.
    * Resolves with `content: null` when nothing here formats that file type.
@@ -398,6 +426,10 @@ const api = {
     ipcRenderer.invoke(CH.gitCommitParents, cwd, commit),
   keelTurn: (cwd: string, paneId?: string): Promise<unknown> =>
     ipcRenderer.invoke(CH.keelTurn, cwd, paneId),
+  /** Each file's text before Claude's latest turn changed it, for turn review. */
+  keelTurnOriginals: (cwd: string, paneId?: string): Promise<{
+    turnId: string; prompt: string; startedAt: number; files: Record<string, string>;
+  } | null> => ipcRenderer.invoke(CH.keelTurnOriginals, cwd, paneId),
   keelBegin: (cwd: string): Promise<unknown> => ipcRenderer.invoke(CH.keelBegin, cwd),
   keelWorklist: (cwd: string): Promise<unknown> => ipcRenderer.invoke(CH.keelWorklist, cwd),
   keelCard: (cwd: string, path: string): Promise<unknown> =>

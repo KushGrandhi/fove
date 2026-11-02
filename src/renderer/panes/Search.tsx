@@ -13,6 +13,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { C } from "../ui/Chrome.js";
+import { previewLine, type ReplaceQuery } from "../ide/replacePreview.js";
+import { replaceIn, type Target } from "../ide/replace.js";
 
 interface Match {
   path: string;
@@ -39,6 +41,13 @@ export function SearchPane(props: {
   const [caseSensitive, setCaseSensitive] = useState(false);
   const [wholeWord, setWholeWord] = useState(false);
   const [glob, setGlob] = useState("");
+  /** The replace row is open; while it is, every hit previews its replacement. */
+  const [replaceOpen, setReplaceOpen] = useState(false);
+  const [replacement, setReplacement] = useState("");
+  const [replacing, setReplacing] = useState(false);
+  /** What the last replace did; kept apart from the search status, which the re-run overwrites. */
+  const [replaceNote, setReplaceNote] = useState<string | null>(null);
+  useEffect(() => setReplaceNote(null), [query, replacement, regex, caseSensitive, wholeWord, glob]);
   const [matches, setMatches] = useState<Match[]>([]);
   const [status, setStatus] = useState<string>("");
   const [searching, setSearching] = useState(false);
@@ -130,9 +139,44 @@ export function SearchPane(props: {
     return [...byFile.entries()];
   }, [matches]);
 
+  const replaceQuery: ReplaceQuery = { query, replace: replacement, regex, caseSensitive, wholeWord };
+
+  /**
+   * Replace, then search again so the list shows what is left. One undo
+   * puts every file back (replace.ts).
+   */
+  const doReplace = async (targets: Target[]) => {
+    if (!targets.length || replacing) return;
+    setReplacing(true);
+    try {
+      const { files, replaced, unsaved } = await replaceIn(
+        targets.map((t) => ({ ...t, path: `${props.cwd}/${t.path}` })),
+        replaceQuery,
+      );
+      runRef.current(query);
+      setReplaceNote(replaced
+        ? `replaced ${replaced} in ${files} file${files === 1 ? "" : "s"} — ⌘Z in any of them undoes it`
+          + (unsaved.length
+            ? `. Not saved, because they had unsaved edits: ${unsaved.map((p) => p.split("/").pop()).join(", ")}`
+            : "")
+        : "nothing to replace");
+    } catch (e) {
+      setReplaceNote(`replace failed: ${String((e as Error)?.message ?? e)}`);
+    } finally {
+      setReplacing(false);
+    }
+  };
+
   return (
     <div style={S.pane}>
       <div style={S.bar}>
+        <button
+          style={S.chevron}
+          title={replaceOpen ? "Hide replace" : "Replace"}
+          onClick={() => setReplaceOpen((v) => !v)}
+        >
+          {replaceOpen ? "▾" : "▸"}
+        </button>
         <input
           autoFocus
           style={S.input}
@@ -146,6 +190,30 @@ export function SearchPane(props: {
         <Toggle on={wholeWord} onClick={() => setWholeWord((v) => !v)} title="Whole word">ab|</Toggle>
         <Toggle on={regex} onClick={() => setRegex((v) => !v)} title="Regular expression">.*</Toggle>
       </div>
+
+      {replaceOpen && (
+        <div style={S.bar}>
+          <span style={S.chevronSpace} />
+          <input
+            style={S.input}
+            placeholder="replace with…  ($1 for a group in a regex)"
+            value={replacement}
+            onChange={(e) => setReplacement(e.target.value)}
+            onKeyDown={(e) => {
+              e.stopPropagation();
+              if (e.key === "Enter" && e.metaKey) void doReplace(grouped.map(([path]) => ({ path })));
+            }}
+          />
+          <button
+            style={S.replaceAll}
+            disabled={!grouped.length || replacing}
+            title="Replace every match listed below (⌘↩ in the box)"
+            onClick={() => void doReplace(grouped.map(([path]) => ({ path })))}
+          >
+            Replace all
+          </button>
+        </div>
+      )}
 
       <div style={S.bar}>
         <input
@@ -167,6 +235,8 @@ export function SearchPane(props: {
           )}
         </div>
       )}
+
+      {replaceNote && <div style={{ ...S.status, color: C.fg }}>{replaceNote}</div>}
 
       <div style={S.results}>
         {fileHits.length > 0 && (
@@ -197,7 +267,12 @@ export function SearchPane(props: {
         {grouped.map(([path, hits]) => (
           <div key={path}>
             <div style={S.file} title={path}>
-              {path} <span style={{ color: C.faint }}>{hits.length}</span>
+              <span style={S.fileName}>{path}</span> <span style={{ color: C.faint }}>{hits.length}</span>
+              {replaceOpen && (
+                <button style={S.rowBtn} title={`Replace in ${path}`} onClick={() => void doReplace([{ path }])}>
+                  replace in file
+                </button>
+              )}
             </div>
             {hits.map((m, i) => (
               <div
@@ -207,11 +282,29 @@ export function SearchPane(props: {
                 onClick={() => props.onOpen?.(`${props.cwd}/${path}`, m.line)}
               >
                 <span style={S.lineNo}>{m.line}</span>
-                <span style={S.snippet}>
-                  {m.text.slice(0, m.start)}
-                  <mark style={S.mark}>{m.text.slice(m.start, m.end)}</mark>
-                  {m.text.slice(m.end)}
-                </span>
+                {replaceOpen ? (
+                  <>
+                    <span style={S.snippet}>
+                      {previewLine(m.text, replaceQuery).map((part, j) =>
+                        part.kind === "same" ? <span key={j}>{part.text}</span>
+                          : part.kind === "old" ? <del key={j} style={S.old}>{part.text}</del>
+                            : <ins key={j} style={S.new}>{part.text}</ins>)}
+                    </span>
+                    <button
+                      style={S.rowBtn}
+                      title="Replace on this line"
+                      onClick={(e) => { e.stopPropagation(); void doReplace([{ path, line: m.line }]); }}
+                    >
+                      ↻
+                    </button>
+                  </>
+                ) : (
+                  <span style={S.snippet}>
+                    {m.text.slice(0, m.start)}
+                    <mark style={S.mark}>{m.text.slice(m.start, m.end)}</mark>
+                    {m.text.slice(m.end)}
+                  </span>
+                )}
               </div>
             ))}
           </div>
@@ -291,8 +384,9 @@ const S: Record<string, React.CSSProperties> = {
     letterSpacing: "0.08em", fontFamily: "Menlo, monospace",
   },
   file: {
+    display: "flex", alignItems: "center", gap: 4,
     padding: "4px 9px", color: "#58a6ff", fontSize: 11,
-    overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+    overflow: "hidden", whiteSpace: "nowrap",
     position: "sticky", top: 0, background: C.panel,
   },
   hit: {
@@ -303,4 +397,21 @@ const S: Record<string, React.CSSProperties> = {
   lineNo: { color: C.faint, minWidth: 38, textAlign: "right", flex: "0 0 auto" },
   snippet: { color: C.dim, overflow: "hidden", textOverflow: "ellipsis" },
   mark: { background: "#3a2d00", color: "#f0c000", borderRadius: 2 },
+  chevron: {
+    width: 16, padding: 0, border: "none", background: "transparent",
+    color: C.faint, cursor: "pointer", fontSize: 10,
+  },
+  chevronSpace: { width: 16, flex: "0 0 auto" },
+  replaceAll: {
+    padding: "2px 8px", borderRadius: 4, border: `1px solid ${C.line}`,
+    background: "transparent", color: C.fg, fontSize: 10, cursor: "pointer", whiteSpace: "nowrap",
+  },
+  fileName: { overflow: "hidden", textOverflow: "ellipsis" },
+  rowBtn: {
+    marginLeft: "auto", padding: "0 6px", borderRadius: 3, border: `1px solid ${C.line}`,
+    background: "transparent", color: C.dim, fontSize: 10, cursor: "pointer", flex: "0 0 auto",
+    fontFamily: "system-ui",
+  },
+  old: { background: "#4b1818", color: "#f08080", textDecoration: "line-through" },
+  new: { background: "#173b22", color: "#7ee2a0", textDecoration: "none" },
 };

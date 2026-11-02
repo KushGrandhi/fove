@@ -1,39 +1,36 @@
 /**
- * A language server, for the languages Monaco has no service of its own for.
+ * Language servers, hosted for the editor.
  *
- * TypeScript needs nothing here -- Monaco ships the real TypeScript language
- * service and `renderer/ide/tsProject.ts` gives it the project to work on.
- * Python has nothing at all, which is why a `.py` file had no go-to-definition
- * and no find-references, and why this exists.
+ * The editor runs VS Code's own language client (`monaco-languageclient`) in
+ * the renderer. A renderer cannot start processes, so this is the other half:
+ * it starts a server, frames and unframes its LSP messages, and passes them
+ * through untouched. Everything a client does -- capabilities, document sync,
+ * completion, diagnostics, rename -- happens in the real client, not here.
  *
- * Deliberately small. It speaks just enough LSP to start a server, keep it
- * told about the buffers that are open, and pass through the requests the
- * editor asks: definition, references, hover, rename. It is not a general
- * client and does not try to be -- no workspace folders beyond the one, no
- * file watching, no diagnostics. Diagnostics stay with `ruff` in lint.ts,
- * which already works and is instant.
+ * Which servers:
+ *   - typescript: `vtsls`, bundled with fove and run on Electron's own Node,
+ *     so it works on a machine with no Node installed. It is tsserver, the
+ *     same engine VS Code uses, and prefers the project's own TypeScript.
+ *   - python: whichever of SERVERS.python is installed (pyright first).
+ *   - ruff: `ruff server`, for Python lint, quick fixes and formatting.
  *
- * **A missing server is the normal case, not an error.** Most machines do not
- * have pyright installed and should not be told off about it: `available()`
- * answers null, the renderer registers nothing, and Python keeps working
- * exactly as well as it did before -- syntax highlighting, ruff diagnostics,
- * and the outline scanner.
+ * **A missing server is the normal case, not an error.** `start` answers why
+ * it could not, and the editor carries on with highlighting alone.
  */
 
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { pathToFileURL } from "node:url";
+import { existsSync } from "node:fs";
+import { createRequire } from "node:module";
+import { join } from "node:path";
 import { ensureToolPath } from "./loginPath.js";
 import { interpreterFor } from "./interpreters.js";
+import { bundledBin } from "./bundled.js";
 
 /**
- * Servers to try, best first.
- *
- * pyright is the one most Python projects are already checked by, so its
- * answers match what CI says. The others are worth trying because a machine
- * that has one of them has it for exactly this purpose.
+ * Installed servers to try, best first, per server kind.
  *
  * Exported so the dependency spec can be held to it: the doctor offers to
- * install the first server for a language, and a rename here that left
+ * install the first server for a kind, and a rename here that left
  * `shared/deps.ts` behind would have it install something this file never
  * looks for. test/deps.test.ts fails on that.
  */
@@ -44,70 +41,125 @@ export const SERVERS: Record<string, { bin: string; args: string[] }[]> = {
     { bin: "jedi-language-server", args: [] },
     { bin: "pylsp", args: [] },
   ],
+  ruff: [{ bin: "ruff", args: ["server"] }],
 };
 
-/** Give a server this long to answer `initialize` before giving up on it. */
-const INIT_TIMEOUT_MS = 20_000;
-/** And this long for any ordinary request, which should be far quicker. */
-const REQUEST_TIMEOUT_MS = 15_000;
-
-interface Pending {
-  resolve: (value: unknown) => void;
-  reject: (reason: Error) => void;
-  timer: ReturnType<typeof setTimeout>;
+interface Spec {
+  command: string;
+  args: string[];
+  env?: NodeJS.ProcessEnv;
+  /** What the editor shows as "the server", e.g. "basedpyright-langserver". */
+  name: string;
 }
 
 /**
- * One server process, and the framing to talk to it.
+ * The bundled vtsls, run on Electron's Node.
  *
- * LSP over stdio is JSON-RPC in `Content-Length`-delimited frames. The reader
- * has to be a real incremental parser rather than a line splitter: a message
- * can arrive split across chunks, and several can arrive in one.
+ * In a packaged app it ships as a plain folder of node_modules under
+ * `Resources/vtsls` (electron-builder `extraResources`), outside the asar
+ * archive: a child process cannot run from inside one, and the builder's own
+ * dependency pruning dropped vtsls's TypeScript as if it were fove's dev-only
+ * copy. In development it is resolved from node_modules.
  */
-class Server {
-  private readonly child: ChildProcessWithoutNullStreams;
-  private readonly pending = new Map<number, Pending>();
+function vtslsScript(): string | null {
+  const resources = (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath;
+  if (resources) {
+    const packaged = join(resources, "vtsls", "node_modules", "@vtsls", "language-server", "bin", "vtsls.js");
+    if (existsSync(packaged)) return packaged;
+  }
+  try {
+    const script = createRequire(__filename).resolve("@vtsls/language-server/bin/vtsls.js");
+    return existsSync(script) ? script : null;
+  } catch {
+    return null;
+  }
+}
+
+function vtslsSpec(): Spec | null {
+  const script = vtslsScript();
+  if (!script) return null;
+  return {
+    command: process.execPath,
+    args: [script, "--stdio"],
+    // Electron's binary behaves as plain Node with this set -- and so does
+    // the tsserver vtsls forks from it, which inherits the environment.
+    env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+    name: "vtsls",
+  };
+}
+
+/**
+ * The first of these paths that exists: the packaged app's Resources copy,
+ * then the development one.
+ */
+function firstExisting(packaged: string[], dev: () => string | null): string | null {
+  const resources = (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath;
+  if (resources) {
+    const p = join(resources, ...packaged);
+    if (existsSync(p)) return p;
+  }
+  try {
+    const d = dev();
+    return d && existsSync(d) ? d : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The servers fove ships, used when the machine has none of its own.
+ *
+ * A new user gets Python navigation, type errors and ruff's lint and format
+ * with nothing installed. A server the user installed still wins: it is the
+ * version their project and CI are pinned to.
+ *
+ *   - python: basedpyright (MIT), pure JavaScript, on Electron's Node
+ *   - ruff: the official ruff binary, fetched and checksummed at build time
+ *     by scripts/fetch-tools.mjs
+ */
+function bundledSpec(kind: string): Spec | null {
+  if (kind === "python") {
+    const script = firstExisting(
+      ["basedpyright", "langserver.index.js"],
+      () => createRequire(__filename).resolve("basedpyright/langserver.index.js"),
+    );
+    return script
+      ? {
+          command: process.execPath,
+          args: [script, "--stdio"],
+          env: { ...process.env, ELECTRON_RUN_AS_NODE: "1" },
+          name: "basedpyright (bundled)",
+        }
+      : null;
+  }
+  if (kind === "ruff") {
+    const bin = bundledBin("ruff");
+    return bin ? { command: bin, args: ["server"], name: "ruff (bundled)" } : null;
+  }
+  return null;
+}
+
+/**
+ * The ruff to run as a command (format on save, the lint fallback): the
+ * user's own if their shell has one, else the one fove ships. Null only in a
+ * development checkout that never ran scripts/fetch-tools.mjs.
+ */
+export async function ruffCommand(): Promise<string | null> {
+  await ensureToolPath();
+  const onPath = await new Promise<boolean>((resolve) => {
+    execFile("ruff", ["--version"], { timeout: 5000 }, (err) => resolve(!err));
+  });
+  if (onPath) return "ruff";
+  return bundledSpec("ruff")?.command ?? null;
+}
+
+/** Splits a server's stdout into LSP messages. Exported for tests. */
+export class FrameReader {
   private buffer = Buffer.alloc(0);
-  private nextId = 1;
-  /** Resolves once `initialize` has come back; requests queue behind it. */
-  readonly ready: Promise<void>;
-  private dead = false;
 
-  constructor(
-    bin: string,
-    args: string[],
-    private readonly root: string,
-    /**
-     * The interpreter this project's dependencies are installed in, when one
-     * was found. Null means "we could not tell", which is the old behaviour.
-     */
-    private readonly pythonPath: string | null = null,
-  ) {
-    this.child = spawn(bin, args, {
-      cwd: root,
-      stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true,
-    });
-    this.child.stdout.on("data", (chunk: Buffer) => this.onData(chunk));
-    // A server's stderr is its own log. Swallowing it keeps a chatty server
-    // from filling the app's console, and a fatal one still shows up as exit.
-    this.child.stderr.resume();
-    this.child.on("exit", () => this.die(new Error("language server exited")));
-    this.child.on("error", (e) => this.die(e));
+  constructor(private readonly onMessage: (msg: unknown) => void) {}
 
-    this.ready = this.initialize();
-  }
-
-  private die(reason: Error): void {
-    this.dead = true;
-    for (const [, p] of this.pending) {
-      clearTimeout(p.timer);
-      p.reject(reason);
-    }
-    this.pending.clear();
-  }
-
-  private onData(chunk: Buffer): void {
+  push(chunk: Buffer): void {
     this.buffer = Buffer.concat([this.buffer, chunk]);
     for (;;) {
       const split = this.buffer.indexOf("\r\n\r\n");
@@ -115,297 +167,170 @@ class Server {
       const header = this.buffer.subarray(0, split).toString("ascii");
       const match = /content-length:\s*(\d+)/i.exec(header);
       if (!match) {
-        // Unparseable header: the stream is out of sync and there is no
-        // honest way back. Drop what we have rather than loop forever.
+        // Out of sync with no honest way back: drop what we have rather than
+        // loop forever on a header we cannot read.
         this.buffer = Buffer.alloc(0);
         return;
       }
       const length = Number(match[1]);
       const start = split + 4;
       if (this.buffer.length < start + length) return;
-
       const body = this.buffer.subarray(start, start + length).toString("utf8");
       this.buffer = this.buffer.subarray(start + length);
       try {
-        this.dispatch(JSON.parse(body));
+        this.onMessage(JSON.parse(body));
       } catch {
-        // Malformed JSON from a server is the server's bug; carry on reading
-        // rather than tearing down a connection that may still work.
+        // A malformed message is the server's bug; keep reading.
       }
-    }
-  }
-
-  /**
-   * What to answer when the *server* asks the client something.
-   *
-   * Only `workspace/configuration` gets a real answer, and only to say which
-   * Python this project uses. Everything else stays null, which is what a
-   * client with no settings says and is perfectly valid.
-   *
-   * Answering null to `workspace/configuration` was not, though. It is how
-   * pyright asks "which interpreter?", and a client that shrugs leaves it with
-   * no site-packages at all: stdlib resolves through typeshed and first-party
-   * code resolves through the workspace, but every third-party import answers
-   * nothing. `from flask import make_response` went nowhere while a local
-   * variable on the same line went straight there -- which presents as
-   * "go-to-definition works on variables but not on functions" and sends you
-   * looking in entirely the wrong place.
-   */
-  private answer(method: string, params: unknown): unknown {
-    if (method !== "workspace/configuration") return null;
-    const items = (params as { items?: { section?: string }[] } | undefined)?.items ?? [{}];
-    // One entry per item asked for, in order -- the protocol is positional.
-    return items.map((item) =>
-      item.section === "python" && this.pythonPath ? { pythonPath: this.pythonPath } : {},
-    );
-  }
-
-  private dispatch(msg: {
-    id?: number; method?: string; params?: unknown;
-    result?: unknown; error?: { message?: string };
-  }): void {
-    // A request *from* the server (workspace/configuration and friends).
-    if (msg.method && msg.id !== undefined) {
-      this.write({ jsonrpc: "2.0", id: msg.id, result: this.answer(msg.method, msg.params) });
-      return;
-    }
-    if (msg.id === undefined) return; // a notification; nothing here wants them
-
-    const p = this.pending.get(msg.id);
-    if (!p) return;
-    this.pending.delete(msg.id);
-    clearTimeout(p.timer);
-    if (msg.error) p.reject(new Error(msg.error.message ?? "language server error"));
-    else p.resolve(msg.result ?? null);
-  }
-
-  private write(message: unknown): void {
-    if (this.dead) return;
-    const body = Buffer.from(JSON.stringify(message), "utf8");
-    this.child.stdin.write(`Content-Length: ${body.length}\r\n\r\n`);
-    this.child.stdin.write(body);
-  }
-
-  request(method: string, params: unknown, timeout = REQUEST_TIMEOUT_MS): Promise<unknown> {
-    if (this.dead) return Promise.reject(new Error("language server is not running"));
-    const id = this.nextId++;
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`${method} timed out`));
-      }, timeout);
-      this.pending.set(id, { resolve, reject, timer });
-      this.write({ jsonrpc: "2.0", id, method, params });
-    });
-  }
-
-  notify(method: string, params: unknown): void {
-    this.write({ jsonrpc: "2.0", method, params });
-  }
-
-  private async initialize(): Promise<void> {
-    const uri = pathToFileURL(this.root).toString();
-    await this.request("initialize", {
-      processId: process.pid,
-      rootUri: uri,
-      workspaceFolders: [{ uri, name: this.root.split("/").pop() ?? "workspace" }],
-      capabilities: {
-        // Only what is actually asked for below. Claiming capabilities a
-        // client does not implement makes a server do work for nobody.
-        textDocument: {
-          synchronization: { dynamicRegistration: false, didSave: true },
-          definition: { linkSupport: false },
-          references: {},
-          hover: { contentFormat: ["markdown", "plaintext"] },
-          rename: { prepareSupport: false },
-        },
-        workspace: { workspaceFolders: true, configuration: true },
-      },
-    }, INIT_TIMEOUT_MS);
-    this.notify("initialized", {});
-  }
-
-  stop(): void {
-    if (this.dead) return;
-    this.dead = true;
-    // Ask, then insist: a server that ignores shutdown must not outlive the
-    // app and keep a project's files open.
-    try {
-      this.notify("exit", {});
-    } finally {
-      this.child.kill();
     }
   }
 }
 
-export class LspService {
-  /**
-   * One server per root and language.
-   *
-   * The *promise* is stored rather than the server, and it is stored before
-   * the first `await` -- so a second caller arriving while the first is still
-   * starting waits for that same process instead of spawning a rival.
-   *
-   * That race was not theoretical. The editor opens a buffer and asks about it
-   * in the same breath: `didOpen` goes over one IPC channel and the definition
-   * request over another, and both reached a `serverFor` that only recorded a
-   * server two awaits later. Two pyrights started, `didOpen` reached the one
-   * that lost the map and every request reached the one that had never heard
-   * of the file -- so Cmd-click in Python answered null, silently, forever
-   * (the renderer only re-sends `didOpen` for a buffer it has not synced).
-   */
-  private readonly servers = new Map<string, Promise<Server | null>>();
-  /** Which binary serves a language here, or null when none does. */
+export function frame(msg: unknown): Buffer {
+  const body = Buffer.from(JSON.stringify(msg), "utf8");
+  return Buffer.concat([Buffer.from(`Content-Length: ${body.length}\r\n\r\n`, "ascii"), body]);
+}
+
+export type StartResult = { ok: true; name: string } | { ok: false; reason: string };
+
+/** How much of a server's stderr to keep for "why did it stop". */
+const STDERR_TAIL = 4000;
+
+export class LanguageServerHost {
+  private readonly running = new Map<string, ChildProcessWithoutNullStreams>();
+  /** Which installed binary serves a kind here, or null when none does. */
   private readonly resolved = new Map<string, { bin: string; args: string[] } | null>();
-  /** Probes still running, so concurrent callers share one rather than race. */
-  private readonly probing = new Map<string, Promise<string | null>>();
+  private readonly probing = new Map<string, Promise<{ bin: string; args: string[] } | null>>();
+
+  constructor(
+    private readonly onMessage: (id: string, msg: unknown) => void,
+    private readonly onExit: (id: string, info: { code: number | null; stderr: string }) => void,
+  ) {}
 
   /**
-   * The server that would serve this language, or null if none is installed.
-   *
-   * Probed once. Installing a language server mid-session and expecting the
-   * editor to notice is not a case worth paying a subprocess-per-check for.
+   * Start a server for one client. `id` is chosen by the renderer and names
+   * the connection in every message after this.
    */
-  available(language: string): Promise<string | null> {
-    const known = this.resolved.get(language);
-    if (known !== undefined) return Promise.resolve(known?.bin ?? null);
+  async start(id: string, kind: string, root: string): Promise<StartResult> {
+    if (this.running.has(id)) return { ok: false, reason: "already started" };
+    const spec = await this.specFor(kind);
+    if (!spec) {
+      return {
+        ok: false,
+        reason: kind === "typescript" ? "the bundled TypeScript server is missing" : `no ${kind} language server is installed`,
+      };
+    }
 
-    const inFlight = this.probing.get(language);
-    if (inFlight) return inFlight;
-
-    const probe = this.probe(language);
-    this.probing.set(language, probe);
-    void probe.finally(() => this.probing.delete(language));
-    return probe;
-  }
-
-  private async probe(language: string): Promise<string | null> {
-    // A language server is installed per machine. Probing before the login
-    // PATH is in place would conclude, permanently, that there is none.
-    await ensureToolPath();
-
-    for (const candidate of SERVERS[language] ?? []) {
-      const ok = await new Promise<boolean>((resolve) => {
-        execFile(candidate.bin, ["--version"], { timeout: 5000 }, (err) => {
-          if (!err) return resolve(true);
-          // A server that ran and objected to --version is still installed:
-          // pyright-langserver exits 1 on it, wanting a transport flag. Only a
-          // failed spawn (err.code is a string, "ENOENT") or a timeout kill
-          // (err.code null, signal set) means there is no working binary.
-          resolve(typeof err.code === "number");
-        });
+    let child: ChildProcessWithoutNullStreams;
+    try {
+      child = spawn(spec.command, spec.args, {
+        cwd: root,
+        env: spec.env ?? process.env,
+        stdio: ["pipe", "pipe", "pipe"],
+        windowsHide: true,
       });
-      if (ok) {
-        this.resolved.set(language, candidate);
-        return candidate.bin;
-      }
+    } catch (e) {
+      return { ok: false, reason: String((e as Error).message ?? e) };
     }
-    this.resolved.set(language, null);
-    return null;
+
+    let stderr = "";
+    const reader = new FrameReader((msg) => this.onMessage(id, msg));
+    child.stdout.on("data", (chunk: Buffer) => reader.push(chunk));
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr = (stderr + chunk.toString("utf8")).slice(-STDERR_TAIL);
+    });
+    child.on("exit", (code) => {
+      this.running.delete(id);
+      this.onExit(id, { code, stderr });
+    });
+    // A failed spawn (ENOENT) arrives here, not as a throw.
+    const failed = await new Promise<string | null>((resolve) => {
+      child.once("error", (e) => resolve(String(e.message ?? e)));
+      child.once("spawn", () => resolve(null));
+    });
+    if (failed) return { ok: false, reason: failed };
+    this.running.set(id, child);
+    return { ok: true, name: spec.name };
   }
 
-  /**
-   * The running server for a root, starting one if this is the first ask.
-   *
-   * Not `async`: the promise has to land in the map *before* control ever
-   * leaves this function, or a caller arriving a tick later still sees an
-   * empty map and starts a second server. The synchronous `set` below is
-   * load-bearing rather than stylistic.
-   */
-  private serverFor(root: string, language: string): Promise<Server | null> {
-    const key = `${language} ${root}`;
-    const running = this.servers.get(key);
-    if (running) return running;
-
-    const starting = this.start(root, language);
-    this.servers.set(key, starting);
-    // A server that never started is a server we do not have. Forget it so a
-    // later request can try again rather than reusing a dead process -- but
-    // only once it has settled, so everyone already queued behind this attempt
-    // gets the same answer.
-    void starting.then(
-      (s) => { if (!s) this.servers.delete(key); },
-      () => { this.servers.delete(key); },
-    );
-    return starting;
+  send(id: string, msg: unknown): void {
+    const child = this.running.get(id);
+    if (!child || child.stdin.destroyed) return;
+    child.stdin.write(frame(msg));
   }
 
-  /** Spawn a server and wait for `initialize`. Null if it never gets there. */
-  private async start(root: string, language: string): Promise<Server | null> {
-    if (!(await this.available(language))) return null;
-    const spec = this.resolved.get(language);
-    if (!spec) return null;
-
-    /*
-     * Resolved before the server starts, not after.
-     *
-     * pyright asks for configuration during initialisation, and an answer that
-     * arrives later is an answer it has already given up on -- it will have
-     * analysed the project against no environment by then.
-     */
-    const pythonPath = language === "python" ? await interpreterFor(root) : null;
-    const server = new Server(spec.bin, spec.args, root, pythonPath);
-    try {
-      await server.ready;
-    } catch {
-      server.stop();
-      return null;
-    }
-    return server;
+  /** Stop one server. The client has normally sent shutdown/exit already. */
+  stop(id: string): void {
+    const child = this.running.get(id);
+    if (!child) return;
+    this.running.delete(id);
+    // A server that ignores exit must not outlive its client and keep a
+    // project's files open.
+    setTimeout(() => { if (child.exitCode === null) child.kill(); }, 2000).unref();
   }
 
-  /**
-   * Pass a request through, or resolve null when there is no server.
-   *
-   * Null rather than a rejection: "no language server" is not a failure the
-   * editor should surface, it is a feature that is simply not present, and a
-   * provider returning nothing is exactly how Monaco expects to hear it.
-   */
-  async request(
-    root: string,
-    language: string,
-    method: string,
-    params: unknown,
-  ): Promise<unknown> {
-    const server = await this.serverFor(root, language);
-    if (!server) return null;
-    try {
-      return await server.request(method, params);
-    } catch {
-      return null;
-    }
-  }
-
-  async notify(root: string, language: string, method: string, params: unknown): Promise<void> {
-    const server = await this.serverFor(root, language);
-    server?.notify(method, params);
-  }
-
-  /**
-   * Forget what was probed, so a server installed since is found.
-   *
-   * The probe is deliberately once-per-session -- but the Setup Check sheet
-   * can *install* a language server while the app is running, and a cache that
-   * still says "there is no pyright" would make its own install look like it
-   * did nothing. Whoever installs one says so here.
-   *
-   * Servers already running are left alone: they are serving a language that
-   * was found, which this does not change.
-   */
-  forget(language?: string): void {
-    if (language === undefined) this.resolved.clear();
-    else this.resolved.delete(language);
-  }
-
-  /**
-   * Stop every server, on quit.
-   *
-   * The map holds promises, so one still starting is stopped when it lands
-   * rather than skipped -- a pyright spawned a moment before quit must not
-   * outlive the app.
-   */
   stopAll(): void {
-    for (const p of this.servers.values()) void p.then((s) => s?.stop(), () => {});
-    this.servers.clear();
+    for (const child of this.running.values()) child.kill();
+    this.running.clear();
+  }
+
+  /** Forget what was probed, so a server installed mid-session is found. */
+  forget(kind?: string): void {
+    if (kind === undefined) this.resolved.clear();
+    else this.resolved.delete(kind);
+  }
+
+  /** The Python a project's dependencies live in, for pyright's configuration. */
+  pythonPath(root: string): Promise<string | null> {
+    return interpreterFor(root);
+  }
+
+  /** The installed binary that would serve a kind, or null. Exported for the doctor's sake. */
+  async available(kind: string): Promise<string | null> {
+    if (kind === "typescript") return vtslsSpec() ? "vtsls" : null;
+    return (await this.probe(kind))?.bin ?? bundledSpec(kind)?.name ?? null;
+  }
+
+  private async specFor(kind: string): Promise<Spec | null> {
+    if (kind === "typescript") return vtslsSpec();
+    const found = await this.probe(kind);
+    if (found) return { command: found.bin, args: found.args, name: found.bin };
+    return bundledSpec(kind);
+  }
+
+  /**
+   * Find an installed server, once. Concurrent callers share one probe, so
+   * two editor panes opening Python at the same moment do not race.
+   */
+  private probe(kind: string): Promise<{ bin: string; args: string[] } | null> {
+    const known = this.resolved.get(kind);
+    if (known !== undefined) return Promise.resolve(known);
+    const inFlight = this.probing.get(kind);
+    if (inFlight) return inFlight;
+    const p = (async () => {
+      // Installed per machine: probing before the login PATH is in place
+      // would conclude, permanently, that there is none.
+      await ensureToolPath();
+      for (const candidate of SERVERS[kind] ?? []) {
+        const ok = await new Promise<boolean>((resolve) => {
+          execFile(candidate.bin, ["--version"], { timeout: 5000 }, (err) => {
+            if (!err) return resolve(true);
+            // A server that ran and objected to --version is still installed:
+            // pyright-langserver exits 1 on it. Only a failed spawn (code is a
+            // string, "ENOENT") or a timeout (code null) means there is none.
+            resolve(typeof err.code === "number");
+          });
+        });
+        if (ok) {
+          this.resolved.set(kind, candidate);
+          return candidate;
+        }
+      }
+      this.resolved.set(kind, null);
+      return null;
+    })();
+    this.probing.set(kind, p);
+    void p.finally(() => this.probing.delete(kind));
+    return p;
   }
 }

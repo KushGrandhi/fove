@@ -1,6 +1,6 @@
 {
   "name": "fove",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "private": true,
   "description": "An AI-optimized developer app",
   "main": "dist/main/main/main.js",
@@ -11,21 +11,43 @@
     "postinstall": "electron-rebuild -f -w node-pty",
     "typecheck": "tsc -p tsconfig.main.json --noEmit && tsc -p tsconfig.renderer.json --noEmit",
     "test": "vitest run",
-    "pack": "npm run build && electron-builder --dir",
-    "dist": "npm run build && electron-builder",
+    "pack": "npm run build && node scripts/fetch-tools.mjs && electron-builder --dir",
+    "dist": "npm run build && node scripts/fetch-tools.mjs && electron-builder",
     "sign:adhoc": "codesign --force --deep --sign - release/mac-arm64/fove.app && codesign -dv release/mac-arm64/fove.app",
     "install:local": "npm run pack && codesign --force --deep --sign - release/mac-arm64/fove.app && rm -rf /Applications/fove.app && cp -R release/mac-arm64/fove.app /Applications/ && codesign --force --deep --sign - /Applications/fove.app && echo 'Installed. Open fove from Spotlight or the Applications folder.'"
   },
   "dependencies": {
+    "@codingame/monaco-vscode-api": "37.6.1",
+    "@codingame/monaco-vscode-bulk-edit-service-override": "37.6.1",
+    "@codingame/monaco-vscode-configuration-service-override": "37.6.1",
+    "@codingame/monaco-vscode-dialogs-service-override": "37.6.1",
+    "@codingame/monaco-vscode-editor-service-override": "37.6.1",
+    "@codingame/monaco-vscode-extensions-service-override": "37.6.1",
+    "@codingame/monaco-vscode-files-service-override": "37.6.1",
+    "@codingame/monaco-vscode-log-service-override": "37.6.1",
+    "@codingame/monaco-vscode-merge-conflict-default-extension": "37.6.1",
+    "@codingame/monaco-vscode-model-service-override": "37.6.1",
+    "@codingame/monaco-vscode-scm-service-override": "37.6.1",
+    "@codingame/monaco-vscode-standalone-css-language-features": "37.6.1",
+    "@codingame/monaco-vscode-standalone-html-language-features": "37.6.1",
+    "@codingame/monaco-vscode-standalone-json-language-features": "37.6.1",
+    "@codingame/monaco-vscode-standalone-languages": "37.6.1",
+    "@codingame/monaco-vscode-standalone-typescript-language-features": "37.6.1",
+    "@codingame/monaco-vscode-working-copy-service-override": "37.6.1",
     "@fontsource/dm-sans": "^5.3.0",
     "@fontsource/ibm-plex-mono": "^5.3.0",
+    "@vtsls/language-server": "0.3.0",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/addon-webgl": "^0.19.0",
     "@xterm/xterm": "^6.0.0",
-    "monaco-editor": "^0.56.0",
+    "basedpyright": "1.40.2",
+    "monaco-editor": "npm:@codingame/monaco-vscode-editor-api@37.6.1",
+    "monaco-languageclient": "11.0.3",
+    "node-diff3": "3.2.1",
     "node-pty": "^1.1.0",
     "react": "^19.2.8",
-    "react-dom": "^19.2.8"
+    "react-dom": "^19.2.8",
+    "vscode": "npm:@codingame/monaco-vscode-extension-api@37.6.1"
   },
   "devDependencies": {
     "@electron/rebuild": "^3.7.2",
@@ -91,6 +113,88 @@
     "dmg": {
       "title": "fove ${version}",
       "icon": "build/icon.icns"
-    }
+    },
+    "extraResources": [
+      {
+        "from": "node_modules/@vscode/l10n",
+        "to": "vtsls/node_modules/@vscode/l10n"
+      },
+      {
+        "from": "node_modules/@vtsls/language-server",
+        "to": "vtsls/node_modules/@vtsls/language-server"
+      },
+      {
+        "from": "node_modules/@vtsls/language-service",
+        "to": "vtsls/node_modules/@vtsls/language-service"
+      },
+      {
+        "from": "node_modules/@vtsls/vscode-fuzzy",
+        "to": "vtsls/node_modules/@vtsls/vscode-fuzzy"
+      },
+      {
+        "from": "node_modules/jsonc-parser",
+        "to": "vtsls/node_modules/jsonc-parser"
+      },
+      {
+        "from": "node_modules/vscode-jsonrpc",
+        "to": "vtsls/node_modules/vscode-jsonrpc"
+      },
+      {
+        "from": "node_modules/vscode-languageserver",
+        "to": "vtsls/node_modules/vscode-languageserver"
+      },
+      {
+        "from": "node_modules/vscode-languageserver-protocol",
+        "to": "vtsls/node_modules/vscode-languageserver-protocol"
+      },
+      {
+        "from": "node_modules/vscode-languageserver-textdocument",
+        "to": "vtsls/node_modules/vscode-languageserver-textdocument"
+      },
+      {
+        "from": "node_modules/vscode-languageserver-types",
+        "to": "vtsls/node_modules/vscode-languageserver-types"
+      },
+      {
+        "from": "node_modules/yallist",
+        "to": "vtsls/node_modules/yallist"
+      },
+      {
+        "from": "node_modules/@vtsls/language-server/node_modules",
+        "to": "vtsls/node_modules/@vtsls/language-server/node_modules",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "node_modules/@vtsls/language-service/node_modules",
+        "to": "vtsls/node_modules/@vtsls/language-service/node_modules",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "node_modules/vscode-languageserver/node_modules",
+        "to": "vtsls/node_modules/vscode-languageserver/node_modules",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "node_modules/vscode-languageserver-protocol/node_modules",
+        "to": "vtsls/node_modules/vscode-languageserver-protocol/node_modules",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "node_modules/basedpyright",
+        "to": "basedpyright"
+      },
+      {
+        "from": "build/bin",
+        "to": "bin"
+      }
+    ]
   }
 }

@@ -53,12 +53,14 @@ import { IntentStore } from "./intentStore.js";
 import { HandoffService } from "./handoffService.js";
 import { FileTreeService } from "./files.js";
 import { WatchService } from "./watch.js";
+import {
+  FileWatcher, diskDelete, diskMkdir, diskRead, diskReaddir, diskRename, diskStat, diskWrite,
+} from "./diskFs.js";
 import { PopoutService } from "./popout.js";
 import { SearchService } from "./search.js";
 import { LintService } from "./lint.js";
 import { FormatService } from "./format.js";
-import { ProjectService } from "./project.js";
-import { LspService } from "./lsp.js";
+import { LanguageServerHost } from "./lsp.js";
 import {
   loadRecipe, saveRecipe, suggestRecipe, createWorktree, applyRecipe, type Recipe,
 } from "./workspace.js";
@@ -165,6 +167,7 @@ app.on("window-all-closed", () => {
 app.on("before-quit", () => {
   ptys.killAll();
   watcher.closeAll();
+  fileWatcher.closeAll();
   popouts.closeAll();
   browsers.closeAll();
   void debugSession.stop();
@@ -358,6 +361,8 @@ ipcMain.handle(CH.handoffReplan, (_e, cwd: string, note: string) =>
 );
 ipcMain.handle(CH.handoffStop, (_e, cwd: string) => handoff.stop(cwd));
 ipcMain.handle(CH.handoffReset, (_e, cwd: string) => handoff.reset(cwd));
+ipcMain.handle(CH.keelTurnOriginals, (_e, cwd: string, paneId?: string) =>
+  keel.turnOriginals(cwd, paneId ? ptys.pidOf(paneId) : undefined));
 ipcMain.handle(CH.keelTurn, (_e, cwd: string, paneId?: string) => {
   // Same translation as claudeSnapshot: a pane id names the session to read,
   // and the pid never crosses into the renderer.
@@ -378,6 +383,45 @@ ipcMain.handle(CH.fsRename, (_e, from: string, to: string) => tree.rename(from, 
 ipcMain.handle(CH.fsDuplicate, (_e, path: string) => tree.duplicate(path));
 ipcMain.handle(CH.fsTrash, (_e, path: string) => tree.trash(path));
 ipcMain.on(CH.fsWatch, (_e, dirs: string[]) => watcher.sync(dirs ?? []));
+
+// ---- the disk, for the editor's VS Code file service ----------------------
+ipcMain.handle(CH.dfsStat, (_e, path: string) => diskStat(path));
+ipcMain.handle(CH.dfsRead, (_e, path: string) => diskRead(path));
+ipcMain.handle(CH.dfsWrite, (_e, path: string, data: Uint8Array, opts: { create: boolean; overwrite: boolean }) =>
+  diskWrite(path, data, opts));
+ipcMain.handle(CH.dfsReaddir, (_e, path: string) => diskReaddir(path));
+ipcMain.handle(CH.dfsMkdir, (_e, path: string) => diskMkdir(path));
+ipcMain.handle(CH.dfsDelete, (_e, path: string, recursive: boolean) => diskDelete(path, recursive));
+ipcMain.handle(CH.dfsRename, (_e, from: string, to: string, overwrite: boolean) =>
+  diskRename(from, to, overwrite));
+
+const fileWatcher = new FileWatcher((changes) => send(CH.dfsChanged, changes));
+/*
+ * Which files each window asked to watch, so a window that closes without
+ * saying goodbye (a crash, a popout torn down) gives its watches back.
+ */
+const watchesBySender = new Map<number, Map<string, number>>();
+ipcMain.on(CH.dfsWatch, (e, path: string) => {
+  const id = e.sender.id;
+  let mine = watchesBySender.get(id);
+  if (!mine) {
+    mine = new Map();
+    watchesBySender.set(id, mine);
+    e.sender.once("destroyed", () => {
+      for (const [p, n] of watchesBySender.get(id) ?? []) for (let i = 0; i < n; i++) fileWatcher.remove(p);
+      watchesBySender.delete(id);
+    });
+  }
+  mine.set(path, (mine.get(path) ?? 0) + 1);
+  void fileWatcher.add(path);
+});
+ipcMain.on(CH.dfsUnwatch, (e, path: string) => {
+  const mine = watchesBySender.get(e.sender.id);
+  const n = mine?.get(path) ?? 0;
+  if (!mine || n === 0) return;
+  if (n === 1) mine.delete(path); else mine.set(path, n - 1);
+  fileWatcher.remove(path);
+});
 
 // ---- workspace recipes ----------------------------------------------------
 // ---- search and diagnostics -----------------------------------------------
@@ -400,8 +444,10 @@ const searcher = new SearchService(
 );
 const linter = new LintService();
 const formatter = new FormatService();
-const project = new ProjectService();
-const lsp = new LspService();
+const lsp = new LanguageServerHost(
+  (id, msg) => send(CH.lsMessage, id, msg),
+  (id, info) => send(CH.lsExit, id, info),
+);
 
 ipcMain.on(CH.searchStart, (_e, id: string, q: Parameters<SearchService["start"]>[1]) =>
   searcher.start(id, q),
@@ -410,20 +456,36 @@ ipcMain.on(CH.searchCancel, (_e, id: string) => searcher.cancel(id));
 ipcMain.handle(CH.lintCheck, (_e, path: string, cwd?: string) => linter.check(path, cwd));
 ipcMain.handle(CH.formatRun, (_e, path: string, content: string, cwd?: string) =>
   formatter.run(path, content, cwd));
-ipcMain.handle(CH.projectSources, (_e, root: string) => project.sources(root));
-ipcMain.handle(CH.lspAvailable, (_e, language: string) => lsp.available(language));
-ipcMain.handle(CH.lspRequest, (_e, root: string, language: string, method: string, params: unknown) =>
-  lsp.request(root, language, method, params));
 /*
- * `handle` rather than `on`, so the renderer can wait for it.
- *
- * A notification is fire-and-forget on the wire, but the editor has to know
- * the server has *heard* about a buffer before it asks a question about it --
- * a `didOpen` still in flight and a definition request already sent is how
- * Cmd-click ends up asking about a file the server does not have open.
+ * Language servers for the editor's language client. Messages go to every
+ * window (ids are unique, so each client takes only its own); a window that
+ * closes stops the servers it started.
  */
-ipcMain.handle(CH.lspNotify, (_e, root: string, language: string, method: string, params: unknown) =>
-  lsp.notify(root, language, method, params));
+const serversBySender = new Map<number, Set<string>>();
+ipcMain.handle(CH.lsStart, async (e, id: string, kind: string, root: string) => {
+  const r = await lsp.start(id, kind, root);
+  if (r.ok) {
+    const sender = e.sender;
+    let mine = serversBySender.get(sender.id);
+    if (!mine) {
+      mine = new Set();
+      serversBySender.set(sender.id, mine);
+      const senderId = sender.id;
+      sender.once("destroyed", () => {
+        for (const sid of serversBySender.get(senderId) ?? []) lsp.stop(sid);
+        serversBySender.delete(senderId);
+      });
+    }
+    mine.add(id);
+  }
+  return r;
+});
+ipcMain.on(CH.lsSend, (_e, id: string, msg: unknown) => lsp.send(id, msg));
+ipcMain.on(CH.lsStop, (e, id: string) => {
+  serversBySender.get(e.sender.id)?.delete(id);
+  lsp.stop(id);
+});
+ipcMain.handle(CH.lsPythonPath, (_e, root: string) => lsp.pythonPath(root));
 
 // ---- browser panes --------------------------------------------------------
 /**

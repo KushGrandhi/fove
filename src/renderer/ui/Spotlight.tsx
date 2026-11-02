@@ -23,6 +23,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { C } from "./Chrome.js";
+import { workspaceSymbols } from "../ide/languageClients.js";
+import { rankPaths, type Span } from "./fuzzy.js";
 
 /** Mirrors SearchMatch in main/search.ts, which is what arrives over IPC. */
 interface Match {
@@ -36,6 +38,8 @@ interface Match {
   isPath?: boolean;
   /** A path hit that matched as a substring rather than a subsequence. */
   exact?: boolean;
+  /** For a ranked path hit: every span the fuzzy scorer matched. */
+  spans?: Span[];
 }
 
 /** A row in the flattened list: what the cursor moves over and Enter opens. */
@@ -60,6 +64,9 @@ const DEBOUNCE_MS = 160;
  */
 const PER_FILE_CAP = 4;
 
+/** File-name hits shown, best first. */
+const FILE_CAP = 50;
+
 /** Total rows rendered. Beyond this the list is a scroll, not an answer. */
 const ROW_CAP = 200;
 
@@ -73,6 +80,8 @@ export function Spotlight(props: {
   const id = useMemo(() => `spotlight-${Math.random().toString(36).slice(2)}`, []);
   const [query, setQuery] = useState("");
   const [matches, setMatches] = useState<Match[]>([]);
+  /** File paths the path pass found, for VS Code's scorer to rank. */
+  const [candidates, setCandidates] = useState<string[]>([]);
   const [cursor, setCursor] = useState(0);
   const [searching, setSearching] = useState(false);
   /** Set once a search has completed, so "no matches" waits for an answer. */
@@ -80,12 +89,20 @@ export function Spotlight(props: {
   /** Why the search could not run at all, if that is what happened. */
   const [failure, setFailure] = useState<string | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
+  /** Counts symbol queries, so a slow answer to an old one is dropped. */
+  const symbolSeq = useRef(0);
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
   useEffect(() => {
     const offMatch = window.th.onSearchMatch((gotId, batch) => {
       if (gotId !== id) return;
-      setMatches((prev) => [...prev, ...(batch as Match[])]);
+      // Path candidates are kept apart: ranking them is the costly part, and
+      // it should not re-run every time a batch of content hits lands.
+      const all = batch as Match[];
+      const paths = all.filter((m) => m.isPath).map((m) => m.path);
+      if (paths.length) setCandidates((prev) => [...prev, ...paths]);
+      const rest = all.filter((m) => !m.isPath);
+      if (rest.length) setMatches((prev) => [...prev, ...rest]);
     });
     const offDone = window.th.onSearchDone((gotId, _count, _truncated, reason) => {
       if (gotId !== id) return;
@@ -103,6 +120,7 @@ export function Spotlight(props: {
   const run = useCallback(
     (q: string) => {
       setMatches([]);
+      setCandidates([]);
       setSettled(false);
       if (!q.trim()) {
         setSearching(false);
@@ -110,10 +128,45 @@ export function Spotlight(props: {
         return;
       }
       setSearching(true);
+      /*
+       * `#name`: symbols across the project, from the language servers --
+       * the same gesture as `#` in VS Code's quick open. Shown through the
+       * same rows, grouped by file, so Enter opens one at its line.
+       */
+      if (q.startsWith("#")) {
+        window.th.searchCancel(id);
+        const seq = ++symbolSeq.current;
+        const prefix = props.cwd.endsWith("/") ? props.cwd : `${props.cwd}/`;
+        void workspaceSymbols(q.slice(1).trim()).then(
+          (found) => {
+            if (seq !== symbolSeq.current) return;
+            setMatches(found
+              .filter((sym) => sym.path.startsWith(prefix))
+              .map((sym) => {
+                const text = [sym.name, sym.kind, sym.container].filter(Boolean).join("  ");
+                return { path: sym.path.slice(prefix.length), line: sym.line, text, start: 0, end: sym.name.length };
+              }));
+            setFailure(found.length ? null
+              : "no symbols: they come from language servers, which start when you open a file of that language");
+            setSearching(false);
+            setSettled(true);
+          },
+          (e) => {
+            if (seq !== symbolSeq.current) return;
+            setFailure(String((e as Error)?.message ?? e));
+            setSearching(false);
+            setSettled(true);
+          },
+        );
+        return;
+      }
+      symbolSeq.current++;
       // Literal, case-insensitive: Spotlight is for finding a known name, and
       // a regex mode here would be a second thing to explain. The search pane
       // keeps the toggles for when the query is really a pattern.
-      window.th.searchStart(id, { query: q, cwd: props.cwd });
+      // Paths come back as candidates and are ranked here, by VS Code's
+      // quick open scorer (fuzzy.ts).
+      window.th.searchStart(id, { query: q, cwd: props.cwd, fuzzyPaths: true });
     },
     [id, props.cwd],
   );
@@ -135,8 +188,15 @@ export function Spotlight(props: {
     return () => clearTimeout(timer.current);
   }, [query]);
 
-  /** Filename hits, in the order the path pass ranked them. */
-  const files = useMemo(() => matches.filter((m) => m.isPath), [matches]);
+  /**
+   * Filename hits, best first: the path pass hands back every candidate and
+   * VS Code's fuzzy scorer picks and orders the shortlist.
+   */
+  const files = useMemo((): Match[] => {
+    if (query.startsWith("#")) return [];
+    return rankPaths(candidates, query, FILE_CAP).map(({ path, spans }) =>
+      ({ path, line: 0, text: path, start: 0, end: 0, isPath: true, spans }));
+  }, [candidates, query]);
 
   /**
    * Content hits grouped by file, capped per file and overall.
@@ -213,7 +273,7 @@ export function Spotlight(props: {
           <input
             autoFocus
             value={query}
-            placeholder="Find a file, or search the code…"
+            placeholder="Find a file, search the code, or # for a symbol…"
             onChange={(e) => setQuery(e.target.value)}
             style={S.input}
             onKeyDown={(e) => {
@@ -239,7 +299,7 @@ export function Spotlight(props: {
           {rows.length === 0 && (
             <div style={S.none}>
               {!query.trim()
-                ? "Type to find a file by name, or any text in the code."
+                ? "Type to find a file by name or any text in the code. Start with # to find a symbol."
                 : searching || !settled
                   ? "searching…"
                   : failure
@@ -254,7 +314,7 @@ export function Spotlight(props: {
               i === 0 && files.length > 0
                 ? "FILES"
                 : i === contentsAt && groups.length > 0
-                  ? "CODE"
+                  ? (query.startsWith("#") ? "SYMBOLS" : "CODE")
                   : null;
             // A file heading inside the contents section: the row above
             // belongs to a different file.
@@ -281,7 +341,7 @@ export function Spotlight(props: {
                     <>
                       <span style={S.icon}>◧</span>
                       <span style={S.pathText}>
-                        <Highlight text={m.text} start={m.start} end={m.end} />
+                        <Highlight text={m.text} start={m.start} end={m.end} spans={m.spans} />
                       </span>
                     </>
                   ) : (
@@ -335,8 +395,21 @@ function lead(text: string): number {
  * multibyte text before the match highlights slightly off rather than
  * wrongly, and the row still opens the right line.
  */
-function Highlight(props: { text: string; start: number; end: number }) {
+function Highlight(props: { text: string; start: number; end: number; spans?: Span[] }) {
   const { text } = props;
+  if (props.spans) {
+    // Several spans, in order and not overlapping, as the fuzzy scorer gives them.
+    const out: React.ReactNode[] = [];
+    let at = 0;
+    for (const [i, sp] of [...props.spans].sort((a, b) => a.start - b.start).entries()) {
+      const s = Math.max(at, sp.start);
+      if (sp.end <= s) continue;
+      out.push(text.slice(at, s), <mark key={i} style={S.mark}>{text.slice(s, sp.end)}</mark>);
+      at = sp.end;
+    }
+    out.push(text.slice(at));
+    return <>{out}</>;
+  }
   const start = Math.max(0, Math.min(props.start, text.length));
   const end = Math.max(start, Math.min(props.end, text.length));
   if (end <= start) return <>{text}</>;

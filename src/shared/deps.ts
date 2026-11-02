@@ -82,7 +82,7 @@ export const DEPS: Dep[] = [
     bin: "rg",
     label: "ripgrep",
     severity: "feature",
-    needs: "the search pane.",
+    needs: "nothing, strictly: fove ships its own ripgrep for Spotlight and the Search pane. Install ripgrep to use it in your own shell too.",
     brew: "ripgrep",
     versionArg: "--version",
   },
@@ -102,12 +102,26 @@ export const DEPS: Dep[] = [
     label: "Pyright",
     severity: "feature",
     needs:
-      "go-to-definition, find-references, rename and hover in Python. Without it .py files keep highlighting, ruff diagnostics and the outline.",
+      "nothing, strictly: fove ships basedpyright for Python navigation and type errors. Install pyright to use the exact version your project and CI pin.",
     brew: "pyright",
     url: "https://microsoft.github.io/pyright/#/installation",
     // The rest of the table in main/lsp.ts, which the editor tries in this
     // order. Held to that list by test/deps.test.ts.
     alternatives: ["basedpyright-langserver", "jedi-language-server", "pylsp"],
+  },
+  {
+    /*
+     * Python lint, quick fixes and formatting, as a language server
+     * (`ruff server`). Without it Python still has pyright's errors and
+     * navigation, just no ruff findings and no format on save.
+     */
+    bin: "ruff",
+    label: "Ruff",
+    severity: "feature",
+    needs: "nothing, strictly: fove ships its own ruff for Python lint and fixes. Install ruff to use your project's pinned version.",
+    brew: "ruff",
+    url: "https://docs.astral.sh/ruff/installation/",
+    versionArg: "--version",
   },
   {
     bin: "code",
