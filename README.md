@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/KusumGrandhi/fove/releases"><img src="https://img.shields.io/github/v/tag/KusumGrandhi/fove?label=version&color=blue" alt="version"></a>
+  <a href="https://github.com/KushGrandhi/fove/releases"><img src="https://img.shields.io/github/v/tag/KushGrandhi/fove?label=version&color=blue" alt="version"></a>
   <img src="https://img.shields.io/badge/platform-macOS%20(Apple%20silicon)-lightgrey" alt="platform">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="license"></a>
 </p>
@@ -43,7 +43,7 @@ resize, pin.
 Requires macOS on Apple silicon, with [Claude Code](https://docs.claude.com/en/docs/claude-code) and git installed.
 
 ```bash
-git clone https://github.com/KusumGrandhi/fove.git
+git clone https://github.com/KushGrandhi/fove.git
 cd fove
 ./scripts/bootstrap.sh
 ```
